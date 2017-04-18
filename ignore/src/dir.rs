@@ -77,12 +77,17 @@ struct IgnoreOptions {
     git_ignore: bool,
     /// Whether to read .git/info/exclude files.
     git_exclude: bool,
+    /// doc
+    hg_global: bool,
+    /// doc
+    hg_ignore: bool,
 }
 
 impl IgnoreOptions {
     /// Returns true if at least one type of ignore rules should be matched.
     fn has_any_ignore_options(&self) -> bool {
-        self.ignore || self.git_global || self.git_ignore || self.git_exclude
+        self.ignore || self.git_global || self.git_ignore ||
+            self.git_exclude || self.hg_ignore || self.hg_global
     }
 }
 
@@ -123,10 +128,12 @@ struct IgnoreInner {
     git_global_matcher: Arc<Gitignore>,
     /// The matcher for .gitignore files.
     git_ignore_matcher: Gitignore,
-    /// doc
-    hg_ignore_matcher: Hgignore,
     /// Special matcher for `.git/info/exclude` files.
     git_exclude_matcher: Gitignore,
+    /// doc
+    hg_global_matcher: Arc<Hgignore>,
+    /// doc
+    hg_ignore_matcher: Hgignore,
     /// Whether this directory contains a .git sub-directory.
     has_git: bool,
     /// Whether this directory contains a .hg sub-directory.
@@ -240,11 +247,14 @@ impl Ignore {
                 errs.maybe_push(err);
                 m
             };
-        let hgi_matcher = {
-            let (m, err) = create_hgignore(&dir, &[".hgignore"]);
-            errs.maybe_push(err);
-            m
-        };
+        let hgi_matcher =
+            if !self.0.opts.hg_ignore {
+                Hgignore::empty()
+            } else {
+                let (m, err) = create_hgignore(&dir, &[".hgignore"]);
+                errs.maybe_push(err);
+                m
+            };
         let gi_exclude_matcher =
             if !self.0.opts.git_exclude {
                 Gitignore::empty()
@@ -265,8 +275,9 @@ impl Ignore {
             ignore_matcher: ig_matcher,
             git_global_matcher: self.0.git_global_matcher.clone(),
             git_ignore_matcher: gi_matcher,
-            hg_ignore_matcher: hgi_matcher,
             git_exclude_matcher: gi_exclude_matcher,
+            hg_global_matcher: self.0.hg_global_matcher.clone(),
+            hg_ignore_matcher: hgi_matcher,
             has_git: dir.join(".git").is_dir(),
             has_hg: dir.join(".hg").is_dir(),
             opts: self.0.opts,
@@ -395,8 +406,10 @@ impl Ignore {
         }
         let m_global = self.0.git_global_matcher.matched(&path, is_dir)
                            .map(IgnoreMatch::gitignore);
+        let m_hg_global = self.0.hg_global_matcher.matched(&path, is_dir)
+                           .map(IgnoreMatch::hgignore);
 
-        m_ignore.or(m_gi).or(m_gi_exclude).or(m_global).or(m_explicit).or(m_hgi)
+        m_ignore.or(m_gi).or(m_gi_exclude).or(m_global).or(m_explicit).or(m_hgi).or(m_hg_global)
     }
 
     /// Returns an iterator over parent ignore matchers, including this one.
@@ -462,6 +475,8 @@ impl IgnoreBuilder {
                 git_global: true,
                 git_ignore: true,
                 git_exclude: true,
+                hg_global: true,
+                hg_ignore: true,
             },
         }
     }
@@ -481,6 +496,16 @@ impl IgnoreBuilder {
                 }
                 gi
             };
+        let hg_global_matcher =
+            if !self.opts.hg_global {
+                Hgignore::empty()
+            } else {
+                let (gi, err) = Hgignore::global();
+                if let Some(err) = err {
+                    debug!("{}", err);
+                }
+                gi
+            };
         Ignore(Arc::new(IgnoreInner {
             compiled: Arc::new(RwLock::new(HashMap::new())),
             dir: self.dir.clone(),
@@ -493,8 +518,9 @@ impl IgnoreBuilder {
             ignore_matcher: Gitignore::empty(),
             git_global_matcher: Arc::new(git_global_matcher),
             git_ignore_matcher: Gitignore::empty(),
-            hg_ignore_matcher: Hgignore::empty(),
             git_exclude_matcher: Gitignore::empty(),
+            hg_global_matcher: Arc::new(hg_global_matcher),
+            hg_ignore_matcher: Hgignore::empty(),
             has_git: false,
             has_hg: false,
             opts: self.opts,
@@ -578,6 +604,18 @@ impl IgnoreBuilder {
     /// This is enabled by default.
     pub fn git_exclude(&mut self, yes: bool) -> &mut IgnoreBuilder {
         self.opts.git_exclude = yes;
+        self
+    }
+
+    /// doc
+    pub fn hg_global(&mut self, yes: bool) -> &mut IgnoreBuilder {
+        self.opts.hg_global = yes;
+        self
+    }
+
+    /// doc
+    pub fn hg_ignore(&mut self, yes: bool) -> &mut IgnoreBuilder {
+        self.opts.hg_ignore = yes;
         self
     }
 }
