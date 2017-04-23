@@ -409,7 +409,8 @@ impl Ignore {
         let m_hg_global = self.0.hg_global_matcher.matched(&path, is_dir)
                            .map(IgnoreMatch::hgignore);
 
-        m_ignore.or(m_gi).or(m_gi_exclude).or(m_global).or(m_explicit).or(m_hgi).or(m_hg_global)
+        m_ignore.or(m_gi).or(m_gi_exclude).or(m_global).or(m_explicit)
+            .or(m_hgi).or(m_hg_global)
     }
 
     /// Returns an iterator over parent ignore matchers, including this one.

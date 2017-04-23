@@ -294,8 +294,27 @@ impl HgignoreBuilder {
     pub fn add_regex_line(
         &mut self,
         from: Option<PathBuf>,
-        mut line: &str,
+        line: &str,
     ) -> Result<&mut HgignoreBuilder, Error> {
+        let glob = Glob {
+            from: from,
+            original: line.to_string(),
+            actual: String::new(),
+            is_only_dir: false,
+        };
+        let parsed = try!(
+            GlobBuilder::new(&line.to_string())
+                // .literal_separator(literal_separator)
+                .from_regex(true)
+                .build()
+                .map_err(|err| {
+                    Error::Glob {
+                        glob: Some(glob.original.clone()),
+                        err: err.kind().to_string(),
+                    }
+                }));
+        self.builder.add(parsed);
+        self.globs.push(glob);
         Ok(self)
     }
 
