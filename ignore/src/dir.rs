@@ -343,8 +343,9 @@ impl Ignore {
         path: &Path,
         is_dir: bool,
     ) -> Match<IgnoreMatch<'a>> {
-        let (mut m_ignore, mut m_gi, mut m_gi_exclude, mut m_explicit, mut m_hgi) =
-            (Match::None, Match::None, Match::None, Match::None, Match::None);
+        let (
+            mut m_ignore, mut m_gi, mut m_gi_exclude, mut m_explicit, mut m_hgi
+        ) = (Match::None, Match::None, Match::None, Match::None, Match::None);
         let mut saw_git = false;
         let mut saw_hg = false;
         for ig in self.parents().take_while(|ig| !ig.0.is_absolute_parent) {
@@ -888,5 +889,49 @@ mod tests {
         assert!(ig2.matched("src/llvm", true).is_none());
         assert!(ig2.matched("foo", false).is_ignore());
         assert!(ig2.matched("src/foo", false).is_ignore());
+    }
+
+    #[test]
+    fn hgignore() {
+        let td = TempDir::new("ignore-test-").unwrap();
+        wfile(td.path().join(".hgignore"), "^foo$\nsyntax: glob\nbar");
+
+        let (ig, err) = IgnoreBuilder::new().build().add_child(td.path());
+        assert!(err.is_none());
+        assert!(ig.matched("foo", false).is_ignore());
+        assert!(ig.matched("bar", false).is_ignore());
+        assert!(ig.matched("food", false).is_none());
+    }
+
+    #[test]
+    fn hgignore_syntax_switch() {
+        let td = TempDir::new("ignore-test-").unwrap();
+        wfile(
+            td.path().join(".hgignore"),
+            "^foo$\nsyntax: glob\nbar\nsyntax: regexp\n^foo.zip"
+        );
+
+        let (ig, err) = IgnoreBuilder::new().build().add_child(td.path());
+        assert!(err.is_none());
+        assert!(ig.matched("foo", false).is_ignore());
+        assert!(ig.matched("bar", false).is_ignore());
+        assert!(ig.matched("food", false).is_none());
+        assert!(ig.matched("foo.zip", false).is_ignore());
+    }
+
+    #[test]
+    fn hgignore_rooted() {
+        let td = TempDir::new("ignore-test-").unwrap();
+        wfile(
+            td.path().join(".hgignore"),
+            "^rooted\n\\.log$\nsyntax: glob\n*.pyc"
+        );
+
+        let (ig, err) = IgnoreBuilder::new().build().add_child(td.path());
+        assert!(err.is_none());
+        assert!(ig.matched("src/test.log", true).is_ignore());
+        assert!(ig.matched("src/foo.pyc", true).is_ignore());
+        assert!(ig.matched("rooted_dir", false).is_ignore());
+        assert!(ig.matched("src/rooted_dir", false).is_none());
     }
 }

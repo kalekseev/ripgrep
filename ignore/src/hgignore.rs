@@ -231,7 +231,7 @@ impl HgignoreBuilder {
     pub fn add<P: AsRef<Path>>(&mut self, path: P) -> Option<Error> {
         lazy_static! {
             static ref RE: Regex = Regex::new(
-                r"(?ium)^syntax:\s*(regex|glob)\s*$").unwrap();
+                r"(?ium)^syntax:\s*(regexp|glob)\s*$").unwrap();
         };
         let mut current_syntax = HgignoreSyntax::Regex;
         let path = path.as_ref();
@@ -259,7 +259,7 @@ impl HgignoreBuilder {
                 Some(caps) => {
                     match str::from_utf8(&caps[1]).ok().unwrap() {
                         "glob" => current_syntax = HgignoreSyntax::Glob,
-                        "regex" => current_syntax = HgignoreSyntax::Regex,
+                        "regexp" => current_syntax = HgignoreSyntax::Regex,
                         _ => (),
                     }
                 },
@@ -393,9 +393,78 @@ impl HgignoreBuilder {
     }
 }
 
+/*
+ * TODO:
+ *   Global configuration like the username setting is typically put into:
+ *
+ *       o %USERPROFILE%\mercurial.ini (on Windows)
+ *
+ *       o $HOME/.hgrc (on Unix, Plan9)
+ *
+ *       The names of these files depend on the system on which Mercurial is installed. \*.rc files from a
+ *       single  directory are read in alphabetical order, later ones overriding earlier ones. Where mul-
+ *       tiple paths are given below, settings from earlier paths override later ones.
+ *
+ *       On Unix, the following files are consulted:
+ *
+ *       o <repo>/.hg/hgrc (per-repository)
+ *
+ *       o $HOME/.hgrc (per-user)
+ *
+ *       o <install-root>/etc/mercurial/hgrc (per-installation)
+ *
+ *       o <install-root>/etc/mercurial/hgrc.d/\*.rc (per-installation)
+ *
+ *       o /etc/mercurial/hgrc (per-system)
+ *
+ *       o /etc/mercurial/hgrc.d/\*.rc (per-system)
+ *
+ *       o <internal>/default.d/\*.rc (defaults)
+ *
+ *       On Windows, the following files are consulted:
+ *
+ *       o <repo>/.hg/hgrc (per-repository)
+ *
+ *       o %USERPROFILE%\.hgrc (per-user)
+ *
+ *       o %USERPROFILE%\Mercurial.ini (per-user)
+ *
+ *       o %HOME%\.hgrc (per-user)
+ *
+ *       o %HOME%\Mercurial.ini (per-user)
+ *
+ *       o HKEY_LOCAL_MACHINE\SOFTWARE\Mercurial (per-installation)
+ *
+ *       o <install-dir>\hgrc.d\*.rc (per-installation)
+ *
+ *       o <install-dir>\Mercurial.ini (per-installation)
+ *
+ *       o <internal>/default.d/\*.rc (defaults)
+ *      Note   The registry key HKEY_LOCAL_MACHINE\SOFTWARE\Wow6432Node\Mercurial is used  when  running
+ *              32-bit Python on 64-bit Windows.
+ *
+ *       On Windows 9x, %HOME% is replaced by %APPDATA%.
+ *
+ *       On Plan9, the following files are consulted:
+ *
+ *       o <repo>/.hg/hgrc (per-repository)
+ *
+ *       o $home/lib/hgrc (per-user)
+ *
+ *       o <install-root>/lib/mercurial/hgrc (per-installation)
+ *
+ *       o <install-root>/lib/mercurial/hgrc.d/\*.rc (per-installation)
+ *
+ *       o /lib/mercurial/hgrc (per-system)
+ *
+ *       o /lib/mercurial/hgrc.d/\*.rc (per-system)
+ *
+ *       o <internal>/default.d/\*.rc (defaults)
+ */
+/// FIXME: parses only ignore setting from $HOME/.hgrc
 fn hgrc_ignore_path() -> Option<PathBuf> {
     hgrc_contents()
-        .and_then(|data| parse_excludes_file(&data))
+        .and_then(|data| parse_ignore_file(&data))
 }
 
 fn hgrc_contents() -> Option<Vec<u8>> {
@@ -412,7 +481,7 @@ fn hgrc_contents() -> Option<Vec<u8>> {
 }
 
 
-fn parse_excludes_file(data: &[u8]) -> Option<PathBuf> {
+fn parse_ignore_file(data: &[u8]) -> Option<PathBuf> {
     lazy_static! {
         static ref RE: Regex = Regex::new(
             r"(?ium)^\s*ignore\s*=\s*(.+)\s*$").unwrap();
