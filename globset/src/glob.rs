@@ -545,7 +545,7 @@ impl<'a> GlobBuilder<'a> {
 
     /// Parses and builds the pattern.
     pub fn build(&self) -> Result<Glob, Error> {
-        if (self.opts.from_regex) {
+        if self.opts.from_regex {
             Ok(Glob {
                 glob: self.glob.to_string(),
                 re: self.glob.to_string(),

@@ -151,7 +151,7 @@ impl Hgignore {
     }
 
     /// Strips the given path such that it's suitable for matching with this
-    /// gitignore matcher.
+    /// hgignore matcher.
     fn strip<'a, P: 'a + AsRef<Path> + ?Sized>(
         &'a self,
         path: &'a P,
