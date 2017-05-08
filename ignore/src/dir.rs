@@ -649,17 +649,17 @@ pub fn create_hgignore(
     let mut builder = HgignoreBuilder::new(dir);
     let mut errs = PartialErrorBuilder::default();
     for name in names {
-        let gipath = dir.join(name);
-        errs.maybe_push_ignore_io(builder.add(gipath));
+        let hgipath = dir.join(name);
+        errs.maybe_push_ignore_io(builder.add(hgipath));
     }
-    let gi = match builder.build() {
-        Ok(gi) => gi,
+    let hgi = match builder.build() {
+        Ok(hgi) => hgi,
         Err(err) => {
             errs.push(err);
             HgignoreBuilder::new(dir).build().unwrap()
         }
     };
-    (gi, errs.into_error_option())
+    (hgi, errs.into_error_option())
 }
 
 #[cfg(test)]

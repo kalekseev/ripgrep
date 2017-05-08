@@ -187,7 +187,7 @@ pub enum HgignoreSyntax {
     /// doc
     Glob,
     /// doc
-    Regex,
+    Regexp,
 }
 
 /// doc
@@ -231,9 +231,9 @@ impl HgignoreBuilder {
     pub fn add<P: AsRef<Path>>(&mut self, path: P) -> Option<Error> {
         lazy_static! {
             static ref RE: Regex = Regex::new(
-                r"(?ium)^syntax:\s*(regexp|glob)\s*$").unwrap();
+                r"^syntax:\s*(regexp|glob)\s*$").unwrap();
         };
-        let mut current_syntax = HgignoreSyntax::Regex;
+        let mut current_syntax = HgignoreSyntax::Regexp;
         let path = path.as_ref();
         let file = match File::open(path) {
             Err(err) => return Some(Error::Io(err).with_path(path)),
@@ -252,15 +252,16 @@ impl HgignoreBuilder {
             };
             match RE.captures(line.as_bytes()) {
                 None => {
-                    if let Err(err) = self.add_line(Some(path.to_path_buf()), &line, current_syntax) {
+                    if let Err(err) = self.add_line(
+                        Some(path.to_path_buf()), &line, current_syntax
+                    ) {
                         errs.push(err.tagged(path, lineno));
                     };
                 },
                 Some(caps) => {
-                    match str::from_utf8(&caps[1]).ok().unwrap() {
-                        "glob" => current_syntax = HgignoreSyntax::Glob,
-                        "regexp" => current_syntax = HgignoreSyntax::Regex,
-                        _ => (),
+                    current_syntax = match &caps[1] {
+                        b"glob" => HgignoreSyntax::Glob,
+                        _ => HgignoreSyntax::Regexp,
                     }
                 },
             };
@@ -286,7 +287,7 @@ impl HgignoreBuilder {
         }
         match current_syntax {
             HgignoreSyntax::Glob => self.add_glob_line(from, line),
-            HgignoreSyntax::Regex => self.add_regex_line(from, line),
+            HgignoreSyntax::Regexp => self.add_regex_line(from, line),
         }
     }
 
