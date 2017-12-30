@@ -54,7 +54,7 @@ pub enum MatchStrategy {
 
 impl MatchStrategy {
     /// Returns a matching strategy for the given pattern.
-    pub fn new(pat: &Glob) -> MatchStrategy {
+    pub fn new(pat: &Pattern) -> MatchStrategy {
         if let Some(lit) = pat.basename_literal() {
             MatchStrategy::BasenameLiteral(lit)
         } else if let Some(lit) = pat.literal() {
@@ -78,29 +78,50 @@ impl MatchStrategy {
 /// It cannot be used directly to match file paths, but it can be converted
 /// to a regular expression string or a matcher.
 #[derive(Clone, Debug, Eq)]
-pub struct Glob {
-    glob: String,
-    re: String,
-    opts: GlobOptions,
-    tokens: Tokens,
+pub enum Pattern {
+    Glob { glob: String, re: String, opts: GlobOptions, tokens: Tokens },
+    Regex(String),
 }
 
-impl PartialEq for Glob {
-  fn eq(&self, other: &Glob) -> bool {
-    self.glob == other.glob && self.opts == other.opts
+// pub struct Glob {
+//     glob: String,
+//     re: String,
+//     opts: GlobOptions,
+//     tokens: Tokens,
+// }
+
+impl PartialEq for Pattern {
+  fn eq(&self, other: &Pattern) -> bool {
+      match (self, other) {
+          (&Pattern::Glob { glob, opts, .. },
+           &Pattern::Glob { glob: oglob, opts: oopts, .. }) =>
+              glob == oglob && opts == oopts,
+          (&Pattern::Regex(re), &Pattern::Regex(ore)) => re == ore,
+          _ => false,
+      }
   }
 }
 
-impl hash::Hash for Glob {
+impl hash::Hash for Pattern {
   fn hash<H: hash::Hasher>(&self, state: &mut H) {
-    self.glob.hash(state);
-    self.opts.hash(state);
+    match self {
+        &Pattern::Glob { glob, opts, .. } => {
+            glob.hash(state);
+            opts.hash(state);
+        }
+        &Pattern::Regex(re) => {
+            re.hash(state);
+        }
+    }
   }
 }
 
-impl fmt::Display for Glob {
+impl fmt::Display for Pattern {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        self.glob.fmt(f)
+        match self {
+            &Pattern::Glob { glob, .. } => glob.fmt(f),
+            &Pattern::Regex(re) => re.fmt(f),
+        }
     }
 }
 
@@ -108,7 +129,7 @@ impl fmt::Display for Glob {
 #[derive(Clone, Debug)]
 pub struct GlobMatcher {
     /// The underlying pattern.
-    pat: Glob,
+    pat: Pattern,
     /// The pattern, as a compiled regex.
     re: Regex,
 }
@@ -188,7 +209,7 @@ pub struct GlobBuilder<'a> {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
-struct GlobOptions {
+pub(crate) struct GlobOptions {
     /// Whether to match case insensitively.
     case_insensitive: bool,
     /// Whether to require a literal separator to match a separator in a file
@@ -225,15 +246,15 @@ enum Token {
     Alternates(Vec<Tokens>),
 }
 
-impl Glob {
+impl Pattern {
     /// Builds a new pattern with default options.
-    pub fn new(glob: &str) -> Result<Glob, Error> {
+    pub fn new(glob: &str) -> Result<Pattern, Error> {
         GlobBuilder::new(glob).build()
     }
 
     /// Returns a matcher for this pattern.
     pub fn compile_matcher(&self) -> GlobMatcher {
-        let re = new_regex(&self.re)
+        let re = new_regex(self.regex())
             .expect("regex compilation shouldn't fail");
         GlobMatcher {
             pat: self.clone(),
@@ -259,13 +280,19 @@ impl Glob {
     }
 
     /// Returns the original glob pattern used to build this pattern.
-    pub fn glob(&self) -> &str {
-        &self.glob
+    pub fn glob(&self) -> Option<String> {
+        match self {
+            &Pattern::Glob { glob, .. } => Some(glob),
+            _ => return None,
+        }
     }
 
     /// Returns the regular expression string for this glob.
     pub fn regex(&self) -> &str {
-        &self.re
+        match self {
+            &Pattern::Glob { re, .. } => &re,
+            &Pattern::Regex(re) => &re,
+        }
     }
 
     /// Returns the pattern as a literal if and only if the pattern must match
@@ -273,11 +300,15 @@ impl Glob {
     ///
     /// The basic format of these patterns is `{literal}`.
     fn literal(&self) -> Option<String> {
-        if self.opts.case_insensitive {
+        let (tokens, opts) = match self {
+            &Pattern::Glob { tokens, opts, .. } => (tokens, opts),
+            _ => return None,
+        };
+        if opts.case_insensitive {
             return None;
         }
         let mut lit = String::new();
-        for t in &*self.tokens {
+        for t in &*tokens {
             match *t {
                 Token::Literal(c) => lit.push(c),
                 _ => return None,
@@ -298,31 +329,35 @@ impl Glob {
     /// the '.'. Also, paths like `.rs` are considered to have an extension
     /// of `.rs`.
     fn ext(&self) -> Option<OsString> {
-        if self.opts.case_insensitive {
+        let (tokens, opts) = match self {
+            &Pattern::Glob { tokens, opts, .. } => (tokens, opts),
+            _ => return None,
+        };
+        if opts.case_insensitive {
             return None;
         }
-        let start = match self.tokens.get(0) {
+        let start = match tokens.get(0) {
             Some(&Token::RecursivePrefix) => 1,
             Some(_) => 0,
             _ => return None,
         };
-        match self.tokens.get(start) {
+        match tokens.get(start) {
             Some(&Token::ZeroOrMore) => {
                 // If there was no recursive prefix, then we only permit
                 // `*` if `*` can match a `/`. For example, if `*` can't
                 // match `/`, then `*.c` doesn't match `foo/bar.c`.
-                if start == 0 && self.opts.literal_separator {
+                if start == 0 && opts.literal_separator {
                     return None;
                 }
             }
             _ => return None,
         }
-        match self.tokens.get(start + 1) {
+        match tokens.get(start + 1) {
             Some(&Token::Literal('.')) => {}
             _ => return None,
         }
         let mut lit = OsStr::new(".").to_os_string();
-        for t in self.tokens[start + 2..].iter() {
+        for t in tokens[start + 2..].iter() {
             match *t {
                 Token::Literal('.') | Token::Literal('/') => return None,
                 Token::Literal(c) => lit.push(c.to_string()),
@@ -340,13 +375,17 @@ impl Glob {
     /// to imply a match. Namely, if an extension is returned, then it is
     /// necessary but not sufficient for a match.
     fn required_ext(&self) -> Option<OsString> {
-        if self.opts.case_insensitive {
+        let (tokens, opts) = match self {
+            &Pattern::Glob { tokens, opts, .. } => (tokens, opts),
+            _ => return None,
+        };
+        if opts.case_insensitive {
             return None;
         }
         // We don't care at all about the beginning of this pattern. All we
         // need to check for is if it ends with a literal of the form `.ext`.
         let mut ext: Vec<char> = vec![]; // built in reverse
-        for t in self.tokens.iter().rev() {
+        for t in tokens.iter().rev() {
             match *t {
                 Token::Literal('/') => return None,
                 Token::Literal(c) => {
@@ -369,12 +408,16 @@ impl Glob {
     /// Returns a literal prefix of this pattern if the entire pattern matches
     /// if the literal prefix matches.
     fn prefix(&self) -> Option<String> {
-        if self.opts.case_insensitive {
+        let (tokens, opts) = match self {
+            &Pattern::Glob { tokens, opts, .. } => (tokens, opts),
+            _ => return None,
+        };
+        if opts.case_insensitive {
             return None;
         }
-        let end = match self.tokens.last() {
+        let end = match tokens.last() {
             Some(&Token::ZeroOrMore) => {
-                if self.opts.literal_separator {
+                if opts.literal_separator {
                     // If a trailing `*` can't match a `/`, then we can't
                     // assume a match of the prefix corresponds to a match
                     // of the overall pattern. e.g., `foo/*` with
@@ -383,12 +426,12 @@ impl Glob {
                     // literal prefix.
                     return None;
                 }
-                self.tokens.len() - 1
+                tokens.len() - 1
             }
-            _ => self.tokens.len(),
+            _ => tokens.len(),
         };
         let mut lit = String::new();
-        for t in &self.tokens[0..end] {
+        for t in &tokens[0..end] {
             match *t {
                 Token::Literal(c) => lit.push(c),
                 _ => return None,
@@ -414,15 +457,19 @@ impl Glob {
     /// When this returns true, the suffix literal is guaranteed to start with
     /// a `/`.
     fn suffix(&self) -> Option<(String, bool)> {
-        if self.opts.case_insensitive {
+        let (tokens, opts) = match self {
+            &Pattern::Glob { tokens, opts, .. } => (tokens, opts),
+            _ => return None,
+        };
+        if opts.case_insensitive {
             return None;
         }
         let mut lit = String::new();
-        let (start, entire) = match self.tokens.get(0) {
+        let (start, entire) = match tokens.get(0) {
             Some(&Token::RecursivePrefix) => {
                 // We only care if this follows a path component if the next
                 // token is a literal.
-                if let Some(&Token::Literal(_)) = self.tokens.get(1) {
+                if let Some(&Token::Literal(_)) = tokens.get(1) {
                     lit.push('/');
                     (1, true)
                 } else {
@@ -431,19 +478,19 @@ impl Glob {
             }
             _ => (0, false),
         };
-        let start = match self.tokens.get(start) {
+        let start = match tokens.get(start) {
             Some(&Token::ZeroOrMore) => {
                 // If literal_separator is enabled, then a `*` can't
                 // necessarily match everything, so reporting a suffix match
                 // as a match of the pattern would be a false positive.
-                if self.opts.literal_separator {
+                if opts.literal_separator {
                     return None;
                 }
                 start + 1
             }
             _ => start,
         };
-        for t in &self.tokens[start..] {
+        for t in &tokens[start..] {
             match *t {
                 Token::Literal(c) => lit.push(c),
                 _ => return None,
@@ -468,47 +515,50 @@ impl Glob {
     /// doesn't *always* match when a file path has a basename of `foo`. e.g.,
     /// `foo` doesn't match `abc/foo`.
     fn basename_tokens(&self) -> Option<&[Token]> {
-        if self.opts.case_insensitive {
-            return None;
-        }
-        let start = match self.tokens.get(0) {
-            Some(&Token::RecursivePrefix) => 1,
-            _ => {
-                // With nothing to gobble up the parent portion of a path,
-                // we can't assume that matching on only the basename is
-                // correct.
+        if let &Pattern::Glob { tokens, opts, .. } = self {
+            if opts.case_insensitive {
                 return None;
             }
-        };
-        if self.tokens[start..].is_empty() {
-            return None;
-        }
-        for t in &self.tokens[start..] {
-            match *t {
-                Token::Literal('/') => return None,
-                Token::Literal(_) => {} // OK
-                Token::Any | Token::ZeroOrMore => {
-                    if !self.opts.literal_separator {
-                        // In this case, `*` and `?` can match a path
-                        // separator, which means this could reach outside
-                        // the basename.
+            let start = match tokens.get(0) {
+                Some(&Token::RecursivePrefix) => 1,
+                _ => {
+                    // With nothing to gobble up the parent portion of a path,
+                    // we can't assume that matching on only the basename is
+                    // correct.
+                    return None;
+                }
+            };
+            if tokens[start..].is_empty() {
+                return None;
+            }
+            for t in &tokens[start..] {
+                match *t {
+                    Token::Literal('/') => return None,
+                    Token::Literal(_) => {} // OK
+                    Token::Any | Token::ZeroOrMore => {
+                        if !opts.literal_separator {
+                            // In this case, `*` and `?` can match a path
+                            // separator, which means this could reach outside
+                            // the basename.
+                            return None;
+                        }
+                    }
+                    Token::RecursivePrefix
+                    | Token::RecursiveSuffix
+                    | Token::RecursiveZeroOrMore => {
+                        return None;
+                    }
+                    Token::Class{..} | Token::Alternates(..) => {
+                        // We *could* be a little smarter here, but either one
+                        // of these is going to prevent our literal optimizations
+                        // anyway, so give up.
                         return None;
                     }
                 }
-                Token::RecursivePrefix
-                | Token::RecursiveSuffix
-                | Token::RecursiveZeroOrMore => {
-                    return None;
-                }
-                Token::Class{..} | Token::Alternates(..) => {
-                    // We *could* be a little smarter here, but either one
-                    // of these is going to prevent our literal optimizations
-                    // anyway, so give up.
-                    return None;
-                }
             }
+            return Some(&tokens[start..])
         }
-        Some(&self.tokens[start..])
+        return None;
     }
 
     /// Returns the pattern as a literal if and only if the pattern exclusiely
@@ -544,42 +594,33 @@ impl<'a> GlobBuilder<'a> {
     }
 
     /// Parses and builds the pattern.
-    pub fn build(&self) -> Result<Glob, Error> {
-        if self.opts.from_regex {
-            Ok(Glob {
-                glob: self.glob.to_string(),
-                re: self.glob.to_string(),
-                opts: self.opts,
-                tokens: Tokens::default(),
+    pub fn build(&self) -> Result<Pattern, Error> {
+        let mut p = Parser {
+            glob: &self.glob,
+            stack: vec![Tokens::default()],
+            chars: self.glob.chars().peekable(),
+            prev: None,
+            cur: None,
+        };
+        try!(p.parse());
+        if p.stack.is_empty() {
+            Err(Error {
+                glob: Some(self.glob.to_string()),
+                kind: ErrorKind::UnopenedAlternates,
+            })
+        } else if p.stack.len() > 1 {
+            Err(Error {
+                glob: Some(self.glob.to_string()),
+                kind: ErrorKind::UnclosedAlternates,
             })
         } else {
-            let mut p = Parser {
-                glob: &self.glob,
-                stack: vec![Tokens::default()],
-                chars: self.glob.chars().peekable(),
-                prev: None,
-                cur: None,
-            };
-            try!(p.parse());
-            if p.stack.is_empty() {
-                Err(Error {
-                    glob: Some(self.glob.to_string()),
-                    kind: ErrorKind::UnopenedAlternates,
-                })
-            } else if p.stack.len() > 1 {
-                Err(Error {
-                    glob: Some(self.glob.to_string()),
-                    kind: ErrorKind::UnclosedAlternates,
-                })
-            } else {
-                let tokens = p.stack.pop().unwrap();
-                Ok(Glob {
-                    glob: self.glob.to_string(),
-                    re: tokens.to_regex_with(&self.opts),
-                    opts: self.opts,
-                    tokens: tokens,
-                })
-            }
+            let tokens = p.stack.pop().unwrap();
+            Ok(Pattern::Glob {
+                glob: self.glob.to_string(),
+                re: tokens.to_regex_with(&self.opts),
+                opts: self.opts,
+                tokens: tokens,
+            })
         }
     }
 

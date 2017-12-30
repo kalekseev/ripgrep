@@ -96,6 +96,7 @@ A `GlobBuilder` can be used to prevent wildcards from matching path separators,
 or to enable case insensitive matching.
 */
 
+#![feature(pub_restricted)]
 #![deny(missing_docs)]
 
 extern crate aho_corasick;
@@ -121,7 +122,7 @@ use pathutil::{
     file_name, file_name_ext, normalize_path, os_str_bytes, path_bytes,
 };
 use glob::MatchStrategy;
-pub use glob::{Glob, GlobBuilder, GlobMatcher};
+pub use glob::{Pattern, GlobBuilder, GlobMatcher};
 
 mod glob;
 mod pathutil;
@@ -358,7 +359,7 @@ impl GlobSet {
         into.dedup();
     }
 
-    fn new(pats: &[Glob]) -> Result<GlobSet, Error> {
+    fn new(pats: &[Pattern]) -> Result<GlobSet, Error> {
         if pats.is_empty() {
             return Ok(GlobSet { len: 0, strats: vec![] });
         }
@@ -422,7 +423,7 @@ impl GlobSet {
 /// GlobSetBuilder builds a group of patterns that can be used to
 /// simultaneously match a file path.
 pub struct GlobSetBuilder {
-    pats: Vec<Glob>,
+    pats: Vec<Pattern>,
 }
 
 impl GlobSetBuilder {
@@ -442,7 +443,7 @@ impl GlobSetBuilder {
 
     /// Add a new pattern to this set.
     #[allow(dead_code)]
-    pub fn add(&mut self, pat: Glob) -> &mut GlobSetBuilder {
+    pub fn add(&mut self, pat: Pattern) -> &mut GlobSetBuilder {
         self.pats.push(pat);
         self
     }
