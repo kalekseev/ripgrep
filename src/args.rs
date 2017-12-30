@@ -35,7 +35,6 @@ pub struct Args {
     paths: Vec<PathBuf>,
     after_context: usize,
     before_context: usize,
-    color: bool,
     color_choice: termcolor::ColorChoice,
     colors: ColorSpecs,
     column: bool,
@@ -154,14 +153,16 @@ impl Args {
 
     /// Retrieve the configured file separator.
     pub fn file_separator(&self) -> Option<Vec<u8>> {
-        let use_heading_sep =
-            self.heading
-            && !self.count
-            && !self.files_with_matches
-            && !self.files_without_matches;
+        let contextless =
+            self.count
+            || self.files_with_matches
+            || self.files_without_matches;
+        let use_heading_sep = self.heading && !contextless;
+
         if use_heading_sep {
             Some(b"".to_vec())
-        } else if self.before_context > 0 || self.after_context > 0 {
+        } else if !contextless
+            && (self.before_context > 0 || self.after_context > 0) {
             Some(self.context_separator.clone())
         } else {
             None
@@ -290,7 +291,7 @@ impl Args {
         wd.parents(!self.no_ignore_parent);
         wd.threads(self.threads());
         if self.sort_files {
-            wd.sort_by(|a, b| a.cmp(b));
+            wd.sort_by_file_name(|a, b| a.cmp(b));
         }
         wd
     }
@@ -319,7 +320,6 @@ impl<'a> ArgMatches<'a> {
             paths: paths,
             after_context: after_context,
             before_context: before_context,
-            color: self.color(),
             color_choice: self.color_choice(),
             colors: try!(self.color_specs()),
             column: self.column(),
@@ -379,7 +379,7 @@ impl<'a> ArgMatches<'a> {
         if self.is_present("file")
             || self.is_present("files")
             || self.is_present("regexp") {
-            if let Some(path) = self.value_of_os("pattern") {
+            if let Some(path) = self.value_of_os("PATTERN") {
                 paths.insert(0, Path::new(path).to_path_buf());
             }
         }
@@ -431,7 +431,8 @@ impl<'a> ArgMatches<'a> {
     ///
     /// Note that if -F/--fixed-strings is set, then all patterns will be
     /// escaped. Similarly, if -w/--word-regexp is set, then all patterns
-    /// are surrounded by `\b`.
+    /// are surrounded by `\b`, and if -x/--line-regexp is set, then all
+    /// patterns are surrounded by `^...$`.
     ///
     /// If any pattern is invalid UTF-8, then an error is returned.
     fn patterns(&self) -> Result<Vec<String>> {
@@ -442,7 +443,7 @@ impl<'a> ArgMatches<'a> {
         match self.values_of_os("regexp") {
             None => {
                 if self.values_of_os("file").is_none() {
-                    if let Some(os_pat) = self.value_of_os("pattern") {
+                    if let Some(os_pat) = self.value_of_os("PATTERN") {
                         pats.push(try!(self.os_str_pattern(os_pat)));
                     }
                 }
@@ -474,7 +475,7 @@ impl<'a> ArgMatches<'a> {
         Ok(pats)
     }
 
-    /// Converts an OsStr pattern to a String pattern, including word
+    /// Converts an OsStr pattern to a String pattern, including line/word
     /// boundaries or escapes if applicable.
     ///
     /// If the pattern is not valid UTF-8, then an error is returned.
@@ -483,10 +484,12 @@ impl<'a> ArgMatches<'a> {
         Ok(self.str_pattern(s))
     }
 
-    /// Converts a &str pattern to a String pattern, including word
+    /// Converts a &str pattern to a String pattern, including line/word
     /// boundaries or escapes if applicable.
     fn str_pattern(&self, pat: &str) -> String {
-        let s = self.word_pattern(self.literal_pattern(pat.to_string()));
+        let litpat = self.literal_pattern(pat.to_string());
+        let s = self.line_pattern(self.word_pattern(litpat));
+
         if s.is_empty() {
             self.empty_pattern()
         } else {
@@ -509,7 +512,17 @@ impl<'a> ArgMatches<'a> {
     /// flag is set. Otherwise, the pattern is returned unchanged.
     fn word_pattern(&self, pat: String) -> String {
         if self.is_present("word-regexp") {
-            format!(r"\b{}\b", pat)
+            format!(r"\b(?:{})\b", pat)
+        } else {
+            pat
+        }
+    }
+
+    /// Returns the given pattern as a line pattern if the -x/--line-regexp
+    /// flag is set. Otherwise, the pattern is returned unchanged.
+    fn line_pattern(&self, pat: String) -> String {
+        if self.is_present("line-regexp") {
+            format!(r"^(?:{})$", pat)
         } else {
             pat
         }
@@ -534,6 +547,7 @@ impl<'a> ArgMatches<'a> {
             false
         } else {
             self.is_present("with-filename")
+            || self.is_present("vimgrep")
             || paths.len() > 1
             || paths.get(0).map_or(false, |p| p.is_dir())
         }
@@ -591,10 +605,10 @@ impl<'a> ArgMatches<'a> {
         if self.is_present("no-line-number") || self.is_present("count") {
             false
         } else {
-            let only_stdin = paths == &[Path::new("-")];
-            self.is_present("line-number")
+            let only_stdin = paths == [Path::new("-")];
+            (atty::is(atty::Stream::Stdout) && !only_stdin)
+            || self.is_present("line-number")
             || self.is_present("column")
-            || (atty::is(atty::Stream::Stdout) && !only_stdin)
             || self.is_present("pretty")
             || self.is_present("vimgrep")
         }
@@ -608,11 +622,11 @@ impl<'a> ArgMatches<'a> {
     /// Returns true if and only if matches should be grouped with file name
     /// headings.
     fn heading(&self) -> bool {
-        if self.is_present("no-heading") {
+        if self.is_present("no-heading") || self.is_present("vimgrep") {
             false
         } else {
-            self.is_present("heading")
-            || atty::is(atty::Stream::Stdout)
+            atty::is(atty::Stream::Stdout)
+            || self.is_present("heading")
             || self.is_present("pretty")
         }
     }
@@ -666,23 +680,6 @@ impl<'a> ArgMatches<'a> {
         })
     }
 
-    /// Returns true if and only if ripgrep should color its output.
-    fn color(&self) -> bool {
-        let preference = match self.0.value_of_lossy("color") {
-            None => "auto".to_string(),
-            Some(v) => v.into_owned(),
-        };
-        if preference == "always" {
-            true
-        } else if self.is_present("vimgrep") {
-            false
-        } else if preference == "auto" {
-            atty::is(atty::Stream::Stdout) || self.is_present("pretty")
-        } else {
-            false
-        }
-    }
-
     /// Returns the user's color choice based on command line parameters and
     /// environment.
     fn color_choice(&self) -> termcolor::ColorChoice {
@@ -694,8 +691,6 @@ impl<'a> ArgMatches<'a> {
             termcolor::ColorChoice::Always
         } else if preference == "ansi" {
             termcolor::ColorChoice::AlwaysAnsi
-        } else if self.is_present("vimgrep") {
-            termcolor::ColorChoice::Never
         } else if preference == "auto" {
             if atty::is(atty::Stream::Stdout) || self.is_present("pretty") {
                 termcolor::ColorChoice::Auto
@@ -714,7 +709,10 @@ impl<'a> ArgMatches<'a> {
     fn color_specs(&self) -> Result<ColorSpecs> {
         // Start with a default set of color specs.
         let mut specs = vec![
+            #[cfg(unix)]
             "path:fg:magenta".parse().unwrap(),
+            #[cfg(windows)]
+            "path:fg:cyan".parse().unwrap(),
             "line:fg:green".parse().unwrap(),
             "match:fg:red".parse().unwrap(),
             "match:style:bold".parse().unwrap(),
@@ -791,6 +789,14 @@ impl<'a> ArgMatches<'a> {
     fn overrides(&self) -> Result<Override> {
         let mut ovr = OverrideBuilder::new(try!(env::current_dir()));
         for glob in self.values_of_lossy_vec("glob") {
+            try!(ovr.add(&glob));
+        }
+        // this is smelly. In the long run it might make sense
+        // to change overridebuilder to be like globsetbuilder
+        // but this would be a breaking change to the ignore crate
+        // so it is being shelved for now...
+        try!(ovr.case_insensitive(true));
+        for glob in self.values_of_lossy_vec("iglob") {
             try!(ovr.add(&glob));
         }
         ovr.build().map_err(From::from)

@@ -3,29 +3,58 @@ use std::fmt;
 use std::path::Path;
 use std::str::FromStr;
 
-use regex::bytes::{Regex, Replacer, Captures};
+use regex::bytes::{Captures, Match, Regex, Replacer};
 use termcolor::{Color, ColorSpec, ParseColorError, WriteColor};
 
 use pathutil::strip_prefix;
 use ignore::types::FileTypeDef;
 
-/// CountingReplacer implements the Replacer interface for Regex,
+/// Track the start and end of replacements to allow coloring them on output.
+#[derive(Debug)]
+struct Offset {
+    start: usize,
+    end: usize,
+}
+
+impl Offset {
+    fn new(start: usize, end: usize) -> Offset {
+        Offset { start: start, end: end }
+    }
+}
+
+impl<'m, 'r> From<&'m Match<'r>> for Offset {
+    fn from(m: &'m Match<'r>) -> Self {
+        Offset{ start: m.start(), end: m.end() }
+    }
+}
+
+/// `CountingReplacer` implements the Replacer interface for Regex,
 /// and counts how often replacement is being performed.
 struct CountingReplacer<'r> {
     replace: &'r [u8],
     count: &'r mut usize,
+    offsets: &'r mut Vec<Offset>,
 }
 
 impl<'r> CountingReplacer<'r> {
-    fn new(replace: &'r [u8], count: &'r mut usize) -> CountingReplacer<'r> {
-        CountingReplacer { replace: replace, count: count }
+    fn new(
+        replace: &'r [u8],
+        count: &'r mut usize,
+        offsets: &'r mut Vec<Offset>,
+    ) -> CountingReplacer<'r> {
+        CountingReplacer { replace: replace, count: count, offsets: offsets, }
     }
 }
 
 impl<'r> Replacer for CountingReplacer<'r> {
     fn replace_append(&mut self, caps: &Captures, dst: &mut Vec<u8>) {
         *self.count += 1;
+        let start = dst.len();
         caps.expand(self.replace, dst);
+        let end = dst.len();
+        if start != end {
+            self.offsets.push(Offset::new(start, end));
+        }
     }
 }
 
@@ -242,15 +271,17 @@ impl<W: WriteColor> Printer<W> {
         line_number: Option<u64>,
     ) {
         if !self.line_per_match && !self.only_matching {
-            let column = re.find(&buf[start..end])
-                           .map(|m| m.start()).unwrap_or(0);
+            let mat = re
+                .find(&buf[start..end])
+                .map(|m| (m.start(), m.end()))
+                .unwrap_or((0, 0));
             return self.write_match(
-                re, path, buf, start, end, line_number, column);
+                re, path, buf, start, end, line_number, mat.0, mat.1);
         }
         for m in re.find_iter(&buf[start..end]) {
-            let column = m.start();
             self.write_match(
-                re, path.as_ref(), buf, start, end, line_number, column);
+                re, path.as_ref(), buf, start, end,
+                line_number, m.start(), m.end());
         }
     }
 
@@ -262,7 +293,8 @@ impl<W: WriteColor> Printer<W> {
         start: usize,
         end: usize,
         line_number: Option<u64>,
-        column: usize,
+        match_start: usize,
+        match_end: usize,
     ) {
         if self.heading && self.with_filename && !self.has_printed {
             self.write_file_sep();
@@ -276,14 +308,20 @@ impl<W: WriteColor> Printer<W> {
             self.line_number(line_number, b':');
         }
         if self.column {
-            self.column_number(column as u64 + 1, b':');
+            self.column_number(match_start as u64 + 1, b':');
         }
         if self.replace.is_some() {
             let mut count = 0;
+            let mut offsets = Vec::new();
             let line = {
                 let replacer = CountingReplacer::new(
-                    self.replace.as_ref().unwrap(), &mut count);
-                re.replace_all(&buf[start..end], replacer)
+                    self.replace.as_ref().unwrap(), &mut count, &mut offsets);
+                if self.only_matching {
+                    re.replace_all(
+                        &buf[start + match_start..start + match_end], replacer)
+                } else {
+                    re.replace_all(&buf[start..end], replacer)
+                }
             };
             if self.max_columns.map_or(false, |m| line.len() > m) {
                 let msg = format!(
@@ -292,40 +330,45 @@ impl<W: WriteColor> Printer<W> {
                 self.write_eol();
                 return;
             }
-            self.write(&line);
-            if line.last() != Some(&self.eol) {
-                self.write_eol();
-            }
+            self.write_matched_line(offsets, &*line, false);
         } else {
-            let line_buf = if self.only_matching {
-                let start_offset = start + column;
-                let m = re.find(&buf[start_offset..end]).unwrap();
-                &buf[start_offset + m.start()..start_offset + m.end()]
+            let buf = if self.only_matching {
+                &buf[start + match_start..start + match_end]
             } else {
                 &buf[start..end]
             };
-            self.write_matched_line(re, line_buf);
-            // write_matched_line guarantees to write a newline.
+            if self.max_columns.map_or(false, |m| buf.len() > m) {
+                let count = re.find_iter(buf).count();
+                let msg = format!("[Omitted long line with {} matches]", count);
+                self.write_colored(msg.as_bytes(), |colors| colors.matched());
+                self.write_eol();
+                return;
+            }
+            let only_match = self.only_matching;
+            self.write_matched_line(
+                re.find_iter(buf).map(|x| Offset::from(&x)), buf, only_match);
         }
     }
 
-    fn write_matched_line(&mut self, re: &Regex, buf: &[u8]) {
-        if self.max_columns.map_or(false, |m| buf.len() > m) {
-            let count = re.find_iter(buf).count();
-            let msg = format!("[Omitted long line with {} matches]", count);
-            self.write_colored(msg.as_bytes(), |colors| colors.matched());
-            self.write_eol();
-            return;
-        }
+    fn write_matched_line<I>(&mut self, offsets: I, buf: &[u8], only_match: bool)
+        where I: IntoIterator<Item=Offset>,
+    {
         if !self.wtr.supports_color() || self.colors.matched().is_none() {
             self.write(buf);
+        } else if only_match {
+            self.write_colored(buf, |colors| colors.matched());
         } else {
             let mut last_written = 0;
-            for m in re.find_iter(buf) {
-                self.write(&buf[last_written..m.start()]);
-                self.write_colored(
-                    &buf[m.start()..m.end()], |colors| colors.matched());
-                last_written = m.end();
+            for o in offsets {
+                self.write(&buf[last_written..o.start]);
+                // This conditional checks if the match is both empty *and*
+                // past the end of the line. In this case, we never want to
+                // emit an additional color escape.
+                if o.start != o.end || o.end != buf.len() {
+                    self.write_colored(
+                        &buf[o.start..o.end], |colors| colors.matched());
+                }
+                last_written = o.end;
             }
             self.write(&buf[last_written..]);
         }
@@ -354,7 +397,7 @@ impl<W: WriteColor> Printer<W> {
             self.line_number(line_number, b'-');
         }
         if self.max_columns.map_or(false, |m| end - start > m) {
-            self.write(format!("[Omitted long context line]").as_bytes());
+            self.write(b"[Omitted long context line]");
             self.write_eol();
             return;
         }
@@ -365,7 +408,7 @@ impl<W: WriteColor> Printer<W> {
     }
 
     fn separator(&mut self, sep: &[u8]) {
-        self.write(&sep);
+        self.write(sep);
     }
 
     fn write_path_sep(&mut self, sep: u8) {
@@ -436,7 +479,7 @@ impl<W: WriteColor> Printer<W> {
     fn write_colored<F>(&mut self, buf: &[u8], get_color: F)
         where F: Fn(&ColorSpecs) -> &ColorSpec
     {
-        let _ = self.wtr.set_color( get_color(&self.colors) );
+        let _ = self.wtr.set_color(get_color(&self.colors));
         self.write(buf);
         let _ = self.wtr.reset();
     }
@@ -502,7 +545,7 @@ impl fmt::Display for Error {
             Error::InvalidFormat(ref original) => {
                 write!(
                     f,
-                    "Invalid color speci format: '{}'. Valid format \
+                    "Invalid color spec format: '{}'. Valid format \
                      is '(path|line|column|match):(fg|bg|style):(value)'.",
                     original)
             }
@@ -569,7 +612,7 @@ pub struct ColorSpecs {
 /// Valid colors are `black`, `blue`, `green`, `red`, `cyan`, `magenta`,
 /// `yellow`, `white`.
 ///
-/// Valid style instructions are `nobold` and `bold`.
+/// Valid style instructions are `nobold`, `bold`, `intense`, `nointense`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Spec {
     ty: OutType,

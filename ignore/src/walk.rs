@@ -1,5 +1,5 @@
 use std::cmp;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, FileType, Metadata};
 use std::io;
@@ -11,7 +11,8 @@ use std::time::Duration;
 use std::vec;
 
 use crossbeam::sync::MsQueue;
-use walkdir::{self, WalkDir, WalkDirIterator, is_same_file};
+use same_file::Handle;
+use walkdir::{self, WalkDir};
 
 use dir::{Ignore, IgnoreBuilder};
 use gitignore::GitignoreBuilder;
@@ -36,8 +37,8 @@ impl DirEntry {
     }
 
     /// Whether this entry corresponds to a symbolic link or not.
-    pub fn path_is_symbolic_link(&self) -> bool {
-        self.dent.path_is_symbolic_link()
+    pub fn path_is_symlink(&self) -> bool {
+        self.dent.path_is_symlink()
     }
 
     /// Returns true if and only if this entry corresponds to stdin.
@@ -137,12 +138,12 @@ impl DirEntryInner {
         }
     }
 
-    fn path_is_symbolic_link(&self) -> bool {
+    fn path_is_symlink(&self) -> bool {
         use self::DirEntryInner::*;
         match *self {
             Stdin => false,
-            Walkdir(ref x) => x.path_is_symbolic_link(),
-            Raw(ref x) => x.path_is_symbolic_link(),
+            Walkdir(ref x) => x.path_is_symlink(),
+            Raw(ref x) => x.path_is_symlink(),
         }
     }
 
@@ -199,6 +200,7 @@ impl DirEntryInner {
 
     #[cfg(unix)]
     fn ino(&self) -> Option<u64> {
+        use walkdir::DirEntryExt;
         use self::DirEntryInner::*;
         match *self {
             Stdin => None,
@@ -244,7 +246,7 @@ impl DirEntryRaw {
         &self.path
     }
 
-    fn path_is_symbolic_link(&self) -> bool {
+    fn path_is_symlink(&self) -> bool {
         self.ty.is_symlink() || self.follow_link
     }
 
@@ -380,16 +382,16 @@ impl DirEntryRaw {
 /// is: `.ignore`, `.gitignore`, `.git/info/exclude`, global gitignore and
 /// finally explicitly added ignore files. Note that precedence between
 /// different types of ignore files is not impacted by the directory hierarchy;
-/// any `.ignore` file overrides all `.gitignore` files. Within each
-/// precedence level, more nested ignore files have a higher precedence over
-/// less nested ignore files.
-/// * Third, if the previous step yields an ignore match, than all matching
-/// is stopped and the path is skipped.. If it yields a whitelist match, then
-/// process continues. A whitelist match can be overridden by a later matcher.
+/// any `.ignore` file overrides all `.gitignore` files. Within each precedence
+/// level, more nested ignore files have a higher precedence than less nested
+/// ignore files.
+/// * Third, if the previous step yields an ignore match, then all matching
+/// is stopped and the path is skipped. If it yields a whitelist match, then
+/// matching continues. A whitelist match can be overridden by a later matcher.
 /// * Fourth, unless the path is a directory, the file type matcher is run on
-/// the path. As above, if it's an ignore match, then all matching is stopped
-/// and the path is skipped. If it's a whitelist match, then matching
-/// continues.
+/// the path. As above, if it yields an ignore match, then all matching is
+/// stopped and the path is skipped. If it yields a whitelist match, then
+/// matching continues.
 /// * Fifth, if the path hasn't been whitelisted and it is hidden, then the
 /// path is skipped.
 /// * Sixth, unless the path is a directory, the size of the file is compared
@@ -404,7 +406,9 @@ pub struct WalkBuilder {
     max_depth: Option<usize>,
     max_filesize: Option<u64>,
     follow_links: bool,
-    sorter: Option<Arc<Fn(&OsString, &OsString) -> cmp::Ordering + 'static>>,
+    sorter: Option<Arc<
+        Fn(&OsStr, &OsStr) -> cmp::Ordering + Send + Sync + 'static
+    >>,
     threads: usize,
 }
 
@@ -458,7 +462,9 @@ impl WalkBuilder {
                 }
                 if let Some(ref cmp) = cmp {
                     let cmp = cmp.clone();
-                    wd = wd.sort_by(move |a, b| cmp(a, b));
+                    wd = wd.sort_by(move |a, b| {
+                        cmp(a.file_name(), b.file_name())
+                    });
                 }
                 (p.to_path_buf(), Some(WalkEventIter::from(wd)))
             }
@@ -571,6 +577,29 @@ impl WalkBuilder {
         self
     }
 
+    /// Enables all the standard ignore filters.
+    ///
+    /// This toggles, as a group, all the filters that are enabled by default:
+    ///
+    /// - [hidden()](#method.hidden)
+    /// - [parents()](#method.parents)
+    /// - [ignore()](#method.ignore)
+    /// - [git_ignore()](#method.git_ignore)
+    /// - [git_global()](#method.git_global)
+    /// - [git_exclude()](#method.git_exclude)
+    ///
+    /// They may still be toggled individually after calling this function.
+    ///
+    /// This is (by definition) enabled by default.
+    pub fn standard_filters(&mut self, yes: bool) -> &mut WalkBuilder {
+        self.hidden(yes)
+            .parents(yes)
+            .ignore(yes)
+            .git_ignore(yes)
+            .git_global(yes)
+            .git_exclude(yes)
+    }
+
     /// Enables ignoring hidden files.
     ///
     /// This is enabled by default.
@@ -610,6 +639,8 @@ impl WalkBuilder {
     /// does not exist or does not specify `core.excludesFile`, then
     /// `$XDG_CONFIG_HOME/git/ignore` is read. If `$XDG_CONFIG_HOME` is not
     /// set or is empty, then `$HOME/.config/git/ignore` is used instead.
+    ///
+    /// This is enabled by default.
     pub fn git_global(&mut self, yes: bool) -> &mut WalkBuilder {
         self.ig_builder.git_global(yes);
         self
@@ -637,6 +668,7 @@ impl WalkBuilder {
         self
     }
 
+    /// Set a function for sorting directory entries.
     /// doc
     pub fn hg_global(&mut self, yes: bool) -> &mut WalkBuilder {
         self.ig_builder.hg_global(yes);
@@ -649,7 +681,7 @@ impl WalkBuilder {
         self
     }
 
-    /// Set a function for sorting directory entries.
+    /// Set a function for sorting directory entries by file name.
     ///
     /// If a compare function is set, the resulting iterator will return all
     /// paths in sorted order. The compare function will be called to compare
@@ -657,8 +689,9 @@ impl WalkBuilder {
     /// entry.
     ///
     /// Note that this is not used in the parallel iterator.
-    pub fn sort_by<F>(&mut self, cmp: F) -> &mut WalkBuilder
-            where F: Fn(&OsString, &OsString) -> cmp::Ordering + 'static {
+    pub fn sort_by_file_name<F>(&mut self, cmp: F) -> &mut WalkBuilder
+    where F: Fn(&OsStr, &OsStr) -> cmp::Ordering + Send + Sync + 'static
+    {
         self.sorter = Some(Arc::new(cmp));
         self
     }
@@ -739,7 +772,7 @@ impl Iterator for Walk {
             };
             match ev {
                 Err(err) => {
-                    return Some(Err(Error::from(err)));
+                    return Some(Err(Error::from_walkdir(err)));
                 }
                 Ok(WalkEvent::Exit) => {
                     self.ig = self.ig.parent().unwrap();
@@ -775,7 +808,7 @@ impl Iterator for Walk {
 /// the entire contents of a directory have been enumerated.
 struct WalkEventIter {
     depth: usize,
-    it: walkdir::Iter,
+    it: walkdir::IntoIter,
     next: Option<Result<walkdir::DirEntry, walkdir::Error>>,
 }
 
@@ -1288,11 +1321,14 @@ fn check_symlink_loop(
     child_path: &Path,
     child_depth: usize,
 ) -> Result<(), Error> {
+    let hchild = Handle::from_path(child_path).map_err(|err| {
+        Error::from(err).with_path(child_path).with_depth(child_depth)
+    })?;
     for ig in ig_parent.parents().take_while(|ig| !ig.is_absolute_parent()) {
-        let same = try!(is_same_file(ig.path(), child_path).map_err(|err| {
+        let h = Handle::from_path(ig.path()).map_err(|err| {
             Error::from(err).with_path(child_path).with_depth(child_depth)
-        }));
-        if same {
+        })?;
+        if hchild == h {
             return Err(Error::Loop {
                 ancestor: ig.path().to_path_buf(),
                 child: child_path.to_path_buf(),

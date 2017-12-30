@@ -169,8 +169,8 @@ impl Gitignore {
         self.num_whitelists
     }
 
-    /// Returns whether the given file path matched a pattern in this gitignore
-    /// matcher.
+    /// Returns whether the given path (file or directory) matched a pattern in
+    /// this gitignore matcher.
     ///
     /// `is_dir` should be true if the path refers to a directory and false
     /// otherwise.
@@ -189,6 +189,48 @@ impl Gitignore {
             return Match::None;
         }
         self.matched_stripped(self.strip(path.as_ref()), is_dir)
+    }
+
+    /// Returns whether the given path (file or directory, and expected to be
+    /// under the root) or any of its parent directories (up to the root)
+    /// matched a pattern in this gitignore matcher.
+    ///
+    /// NOTE: This method is more expensive than walking the directory hierarchy
+    /// top-to-bottom and matching the entries. But, is easier to use in cases
+    /// when a list of paths are available without a hierarchy.
+    ///
+    /// `is_dir` should be true if the path refers to a directory and false
+    /// otherwise.
+    ///
+    /// The given path is matched relative to the path given when building
+    /// the matcher. Specifically, before matching `path`, its prefix (as
+    /// determined by a common suffix of the directory containing this
+    /// gitignore) is stripped. If there is no common suffix/prefix overlap,
+    /// then `path` is assumed to be relative to this matcher.
+    pub fn matched_path_or_any_parents<P: AsRef<Path>>(
+        &self,
+        path: P,
+        is_dir: bool,
+    ) -> Match<&Glob> {
+        if self.is_empty() {
+            return Match::None;
+        }
+        let mut path = self.strip(path.as_ref());
+        debug_assert!(
+            !path.has_root(),
+            "path is expect to be under the root"
+        );
+        match self.matched_stripped(path, is_dir) {
+            Match::None => (), // walk up
+            a_match => return a_match,
+        }
+        while let Some(parent) = path.parent() {
+            match self.matched_stripped(parent, /* is_dir */ true) {
+                Match::None => path = parent, // walk up
+                a_match => return a_match,
+            }
+        }
+        Match::None
     }
 
     /// Like matched, but takes a path that has already been stripped.
@@ -254,6 +296,7 @@ pub struct GitignoreBuilder {
     builder: GlobSetBuilder,
     root: PathBuf,
     globs: Vec<Glob>,
+    case_insensitive: bool,
 }
 
 impl GitignoreBuilder {
@@ -269,6 +312,7 @@ impl GitignoreBuilder {
             builder: GlobSetBuilder::new(),
             root: strip_prefix("./", root).unwrap_or(root).to_path_buf(),
             globs: vec![],
+            case_insensitive: false,
         }
     }
 
@@ -411,7 +455,7 @@ impl GitignoreBuilder {
         // anywhere, so use a **/ prefix.
         if !is_absolute {
             // ... but only if we don't already have a **/ prefix.
-            if !glob.actual.starts_with("**/") {
+            if !(glob.actual.starts_with("**/") || (glob.actual == "**" && glob.is_only_dir)) {
                 glob.actual = format!("**/{}", glob.actual);
             }
         }
@@ -424,6 +468,7 @@ impl GitignoreBuilder {
         let parsed = try!(
             GlobBuilder::new(&glob.actual)
                 .literal_separator(literal_separator)
+                .case_insensitive(self.case_insensitive)
                 .build()
                 .map_err(|err| {
                     Error::Glob {
@@ -433,6 +478,16 @@ impl GitignoreBuilder {
                 }));
         self.builder.add(parsed);
         self.globs.push(glob);
+        Ok(self)
+    }
+
+    /// Toggle whether the globs should be matched case insensitively or not.
+    ///
+    /// This is disabled by default.
+    pub fn case_insensitive(
+        &mut self, yes: bool
+    ) -> Result<&mut GitignoreBuilder, Error> {
+        self.case_insensitive = yes;
         Ok(self)
     }
 }
@@ -565,6 +620,7 @@ mod tests {
     ignored!(ig28, ROOT, "src/*.rs", "src/grep/src/main.rs");
     ignored!(ig29, "./src", "/llvm/", "./src/llvm", true);
     ignored!(ig30, ROOT, "node_modules/ ", "node_modules", true);
+    ignored!(ig31, ROOT, "**/", "foo/bar", true);
 
     not_ignored!(ignot1, ROOT, "amonths", "months");
     not_ignored!(ignot2, ROOT, "monthsa", "months");
@@ -583,6 +639,7 @@ mod tests {
         ignot14, "./third_party/protobuf", "m4/ltoptions.m4",
         "./third_party/protobuf/csharp/src/packages/repositories.config");
     not_ignored!(ignot15, ROOT, "!/bar", "foo/bar");
+    not_ignored!(ignot16, ROOT, "*\n!**/", "foo", true);
 
     fn bytes(s: &str) -> Vec<u8> {
         s.to_string().into_bytes()
@@ -617,4 +674,21 @@ mod tests {
     fn regression_106() {
         gi_from_str("/", " ");
     }
+
+    #[test]
+    fn case_insensitive() {
+        let gi = GitignoreBuilder::new(ROOT)
+            .case_insensitive(true).unwrap()
+            .add_str(None, "*.html").unwrap()
+            .build().unwrap();
+        assert!(gi.matched("foo.html", false).is_ignore());
+        assert!(gi.matched("foo.HTML", false).is_ignore());
+        assert!(!gi.matched("foo.htm", false).is_ignore());
+        assert!(!gi.matched("foo.HTM", false).is_ignore());
+    }
+
+    ignored!(cs1, ROOT, "*.html", "foo.html");
+    not_ignored!(cs2, ROOT, "*.html", "foo.HTML");
+    not_ignored!(cs3, ROOT, "*.html", "foo.htm");
+    not_ignored!(cs4, ROOT, "*.html", "foo.HTM");
 }

@@ -125,7 +125,7 @@ sherlock:be, to a very large extent, the result of luck. Sherlock Holmes
 
 sherlock!(with_heading, |wd: WorkDir, mut cmd: Command| {
     // This forces the issue since --with-filename is disabled by default
-    // when searching one fil.e
+    // when searching one file.
     cmd.arg("--with-filename").arg("--heading");
     let lines: String = wd.stdout(&mut cmd);
     let expected = "\
@@ -209,6 +209,16 @@ For the Doctor Watsons of this world, as opposed to the Sherlock
     assert_eq!(lines, expected);
 });
 
+sherlock!(line, "Watson|and exhibited clearly, with a label attached.",
+|wd: WorkDir, mut cmd: Command| {
+    cmd.arg("-x");
+    let lines: String = wd.stdout(&mut cmd);
+    let expected = "\
+and exhibited clearly, with a label attached.
+";
+    assert_eq!(lines, expected);
+});
+
 sherlock!(literal, "()", "file", |wd: WorkDir, mut cmd: Command| {
     wd.create("file", "blib\n()\nblab\n");
     cmd.arg("-F");
@@ -252,6 +262,20 @@ sherlock!(replace_named_groups, "(?P<first>[A-Z][a-z]+) (?P<last>[A-Z][a-z]+)",
 For the Watsons, Doctor of this world, as opposed to the Sherlock
 be, to a very large extent, the result of luck. Holmes, Sherlock
 but Watson, Doctor has to have it taken out for him and dusted,
+";
+    assert_eq!(lines, expected);
+});
+
+sherlock!(replace_with_only_matching, "of (\\w+)",
+|wd: WorkDir, mut cmd: Command| {
+    cmd.arg("-o").arg("-r").arg("$1");
+    let lines: String = wd.stdout(&mut cmd);
+    let expected = "\
+this
+detective
+luck
+straw
+cigar
 ";
     assert_eq!(lines, expected);
 });
@@ -334,6 +358,21 @@ sherlock!(glob_negate, "Sherlock", ".", |wd: WorkDir, mut cmd: Command| {
     cmd.arg("-g").arg("!*.rs");
     let lines: String = wd.stdout(&mut cmd);
     assert_eq!(lines, "file.py:Sherlock\n");
+});
+
+sherlock!(iglob, "Sherlock", ".", |wd: WorkDir, mut cmd: Command| {
+    wd.create("file.HTML", "Sherlock");
+    cmd.arg("--iglob").arg("*.html");
+    let lines: String = wd.stdout(&mut cmd);
+    assert_eq!(lines, "file.HTML:Sherlock\n");
+});
+
+sherlock!(csglob, "Sherlock", ".", |wd: WorkDir, mut cmd: Command| {
+    wd.create("file1.HTML", "Sherlock");
+    wd.create("file2.html", "Sherlock");
+    cmd.arg("--glob").arg("*.html");
+    let lines: String = wd.stdout(&mut cmd);
+    assert_eq!(lines, "file2.html:Sherlock\n");
 });
 
 sherlock!(count, "Sherlock", ".", |wd: WorkDir, mut cmd: Command| {
@@ -989,12 +1028,15 @@ fn regression_210() {
     let badutf8 = OsStr::from_bytes(&b"foo\xffbar"[..]);
 
     let wd = WorkDir::new("regression_210");
-    let mut cmd = wd.command();
-    wd.create(badutf8, "test");
-    cmd.arg("-H").arg("test").arg(badutf8);
+    // APFS does not support creating files with invalid UTF-8 bytes.
+    // https://github.com/BurntSushi/ripgrep/issues/559
+    if wd.try_create(badutf8, "test").is_ok() {
+        let mut cmd = wd.command();
+        cmd.arg("-H").arg("test").arg(badutf8);
 
-    let out = wd.output(&mut cmd);
-    assert_eq!(out.stdout, b"foo\xffbar:test\n".to_vec());
+        let out = wd.output(&mut cmd);
+        assert_eq!(out.stdout, b"foo\xffbar:test\n".to_vec());
+    }
 }
 
 // See: https://github.com/BurntSushi/ripgrep/issues/228
@@ -1065,21 +1107,25 @@ clean!(regression_405, "test", ".", |wd: WorkDir, mut cmd: Command| {
 });
 
 // See: https://github.com/BurntSushi/ripgrep/issues/428
-clean!(regression_428_color_context_path, "foo", ".", |wd: WorkDir, mut cmd: Command| {
+#[cfg(not(windows))]
+clean!(regression_428_color_context_path, "foo", ".",
+|wd: WorkDir, mut cmd: Command| {
     wd.create("sherlock", "foo\nbar");
     cmd.arg("-A1").arg("-H").arg("--no-heading").arg("-N")
        .arg("--colors=match:none").arg("--color=always");
 
     let lines: String = wd.stdout(&mut cmd);
-    let expected = format!("\
-{colored_path}:foo
-{colored_path}-bar
-", colored_path=format!("\x1b\x5b\x6d\x1b\x5b\x33\x35\x6d{path}\x1b\x5b\x6d", path=path("sherlock")));
+    let expected = format!(
+        "{colored_path}:foo\n{colored_path}-bar\n",
+        colored_path=format!(
+            "\x1b\x5b\x6d\x1b\x5b\x33\x35\x6d{path}\x1b\x5b\x6d",
+            path=path("sherlock")));
     assert_eq!(lines, expected);
 });
 
 // See: https://github.com/BurntSushi/ripgrep/issues/428
-clean!(regression_428_unrecognized_style, "Sherlok", ".", |wd: WorkDir, mut cmd: Command| {
+clean!(regression_428_unrecognized_style, "Sherlok", ".",
+|wd: WorkDir, mut cmd: Command| {
     cmd.arg("--colors=match:style:");
     wd.assert_err(&mut cmd);
 
@@ -1089,6 +1135,38 @@ clean!(regression_428_unrecognized_style, "Sherlok", ".", |wd: WorkDir, mut cmd:
 Unrecognized style attribute ''. Choose from: nobold, bold, nointense, intense.
 ";
     assert_eq!(err, expected);
+});
+
+// See: https://github.com/BurntSushi/ripgrep/issues/493
+clean!(regression_493, " 're ", "input.txt", |wd: WorkDir, mut cmd: Command| {
+    wd.create("input.txt", "peshwaship 're seminomata");
+    cmd.arg("-o").arg("-w");
+
+    let lines: String = wd.stdout(&mut cmd);
+    assert_eq!(lines, " 're \n");
+});
+
+// See: https://github.com/BurntSushi/ripgrep/issues/599
+clean!(regression_599, "^$", "input.txt", |wd: WorkDir, mut cmd: Command| {
+    wd.create("input.txt", "\n\ntest\n");
+    cmd.args(&[
+        "--color", "ansi",
+        "--colors", "path:none",
+        "--colors", "line:none",
+        "--colors", "match:fg:red",
+        "--colors", "match:style:nobold",
+        "--line-number",
+    ]);
+
+    let lines: String = wd.stdout(&mut cmd);
+    // Technically, the expected output should only be two lines, but:
+    // https://github.com/BurntSushi/ripgrep/issues/441
+    let expected = "\
+[m1[m:[m[31m[m
+[m2[m:[m[31m[m
+[m4[m:
+";
+    assert_eq!(expected, lines);
 });
 
 // See: https://github.com/BurntSushi/ripgrep/issues/1
@@ -1649,6 +1727,94 @@ fn regression_451_only_matching() {
 2:3:3
 ";
 
+    assert_eq!(lines, expected);
+}
+
+// See: https://github.com/BurntSushi/ripgrep/issues/483
+#[test]
+fn regression_483_matching_no_stdout() {
+    let wd = WorkDir::new("regression_483_matching_no_stdout");
+    wd.create("file.py", "");
+
+    let mut cmd = wd.command();
+    cmd.arg("--quiet")
+       .arg("--files")
+       .arg("--glob").arg("*.py");
+
+    let lines: String = wd.stdout(&mut cmd);
+    assert!(lines.is_empty());
+}
+
+// See: https://github.com/BurntSushi/ripgrep/issues/483
+#[test]
+fn regression_483_non_matching_exit_code() {
+    let wd = WorkDir::new("regression_483_non_matching_exit_code");
+    wd.create("file.rs", "");
+
+    let mut cmd = wd.command();
+    cmd.arg("--quiet")
+       .arg("--files")
+       .arg("--glob").arg("*.py");
+
+    wd.assert_err(&mut cmd);
+}
+
+// See: https://github.com/BurntSushi/ripgrep/issues/506
+#[test]
+fn regression_506_word_boundaries_not_parenthesized() {
+    let wd = WorkDir::new("regression_506_word_boundaries_not_parenthesized");
+    let path = "wb.txt";
+    wd.create(path, "min minimum amin\n\
+              max maximum amax");
+
+    let mut cmd = wd.command();
+    cmd.arg("-w").arg("min|max").arg(path).arg("--only-matching");
+    let lines: String = wd.stdout(&mut cmd);
+
+    let expected = "min\nmax\n";
+
+    assert_eq!(lines, expected);
+}
+
+// See: https://github.com/BurntSushi/ripgrep/issues/568
+#[test]
+fn regression_568_leading_hyphen_option_arguments() {
+    let wd = WorkDir::new("regression_568_leading_hyphen_option_arguments");
+    let path = "file";
+    wd.create(path, "foo bar -baz\n");
+
+    let mut cmd = wd.command();
+    cmd.arg("-e-baz").arg("-e").arg("-baz").arg(path);
+    let lines: String = wd.stdout(&mut cmd);
+    assert_eq!(lines, "foo bar -baz\n");
+
+    let mut cmd = wd.command();
+    cmd.arg("-rni").arg("bar").arg(path);
+    let lines: String = wd.stdout(&mut cmd);
+    assert_eq!(lines, "foo ni -baz\n");
+
+    let mut cmd = wd.command();
+    cmd.arg("-r").arg("-n").arg("-i").arg("bar").arg(path);
+    let lines: String = wd.stdout(&mut cmd);
+    assert_eq!(lines, "foo -n -baz\n");
+}
+
+// See: https://github.com/BurntSushi/ripgrep/issues/693
+#[test]
+fn regression_693_context_option_in_contextless_mode() {
+    let wd = WorkDir::new("regression_693_context_option_in_contextless_mode");
+
+    wd.create("foo", "xyz\n");
+    wd.create("bar", "xyz\n");
+
+    let mut cmd = wd.command();
+    cmd.arg("-C1").arg("-c").arg("--sort-files").arg("xyz");
+
+    let lines: String = wd.stdout(&mut cmd);
+    let expected = "\
+bar:1
+foo:1
+";
     assert_eq!(lines, expected);
 }
 

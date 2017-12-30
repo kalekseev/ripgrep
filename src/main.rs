@@ -8,7 +8,6 @@ extern crate grep;
 extern crate ignore;
 #[macro_use]
 extern crate lazy_static;
-extern crate libc;
 #[macro_use]
 extern crate log;
 extern crate memchr;
@@ -55,6 +54,7 @@ mod worker;
 pub type Result<T> = result::Result<T, Box<Error + Send + Sync>>;
 
 fn main() {
+    reset_sigpipe();
     match Args::parse().map(Arc::new).and_then(run) {
         Ok(0) => process::exit(1),
         Ok(_) => process::exit(0),
@@ -72,31 +72,31 @@ fn run(args: Arc<Args>) -> Result<u64> {
     let threads = args.threads();
     if args.files() {
         if threads == 1 || args.is_one_path() {
-            run_files_one_thread(args)
+            run_files_one_thread(&args)
         } else {
             run_files_parallel(args)
         }
     } else if args.type_list() {
-        run_types(args)
+        run_types(&args)
     } else if threads == 1 || args.is_one_path() {
-        run_one_thread(args)
+        run_one_thread(&args)
     } else {
-        run_parallel(args)
+        run_parallel(&args)
     }
 }
 
-fn run_parallel(args: Arc<Args>) -> Result<u64> {
+fn run_parallel(args: &Arc<Args>) -> Result<u64> {
     let bufwtr = Arc::new(args.buffer_writer());
     let quiet_matched = args.quiet_matched();
     let paths_searched = Arc::new(AtomicUsize::new(0));
     let match_count = Arc::new(AtomicUsize::new(0));
 
     args.walker_parallel().run(|| {
-        let args = args.clone();
+        let args = Arc::clone(args);
         let quiet_matched = quiet_matched.clone();
         let paths_searched = paths_searched.clone();
         let match_count = match_count.clone();
-        let bufwtr = bufwtr.clone();
+        let bufwtr = Arc::clone(&bufwtr);
         let mut buf = bufwtr.buffer();
         let mut worker = args.worker();
         Box::new(move |result| {
@@ -108,6 +108,7 @@ fn run_parallel(args: Arc<Args>) -> Result<u64> {
             let dent = match get_or_log_dir_entry(
                 result,
                 args.stdout_handle(),
+                args.files(),
                 args.no_messages(),
             ) {
                 None => return Continue,
@@ -144,7 +145,7 @@ fn run_parallel(args: Arc<Args>) -> Result<u64> {
     Ok(match_count.load(Ordering::SeqCst) as u64)
 }
 
-fn run_one_thread(args: Arc<Args>) -> Result<u64> {
+fn run_one_thread(args: &Arc<Args>) -> Result<u64> {
     let stdout = args.stdout();
     let mut stdout = stdout.lock();
     let mut worker = args.worker();
@@ -154,6 +155,7 @@ fn run_one_thread(args: Arc<Args>) -> Result<u64> {
         let dent = match get_or_log_dir_entry(
             result,
             args.stdout_handle(),
+            args.files(),
             args.no_messages(),
         ) {
             None => continue,
@@ -185,25 +187,28 @@ fn run_one_thread(args: Arc<Args>) -> Result<u64> {
 }
 
 fn run_files_parallel(args: Arc<Args>) -> Result<u64> {
-    let print_args = args.clone();
+    let print_args = Arc::clone(&args);
     let (tx, rx) = mpsc::channel::<ignore::DirEntry>();
     let print_thread = thread::spawn(move || {
         let stdout = print_args.stdout();
         let mut printer = print_args.printer(stdout.lock());
         let mut file_count = 0;
         for dent in rx.iter() {
-            printer.path(dent.path());
+            if !print_args.quiet() {
+                printer.path(dent.path());
+            }
             file_count += 1;
         }
         file_count
     });
     args.walker_parallel().run(move || {
-        let args = args.clone();
+        let args = Arc::clone(&args);
         let tx = tx.clone();
         Box::new(move |result| {
             if let Some(dent) = get_or_log_dir_entry(
                 result,
                 args.stdout_handle(),
+                args.files(),
                 args.no_messages(),
             ) {
                 tx.send(dent).unwrap();
@@ -214,7 +219,7 @@ fn run_files_parallel(args: Arc<Args>) -> Result<u64> {
     Ok(print_thread.join().unwrap())
 }
 
-fn run_files_one_thread(args: Arc<Args>) -> Result<u64> {
+fn run_files_one_thread(args: &Arc<Args>) -> Result<u64> {
     let stdout = args.stdout();
     let mut printer = args.printer(stdout.lock());
     let mut file_count = 0;
@@ -222,18 +227,21 @@ fn run_files_one_thread(args: Arc<Args>) -> Result<u64> {
         let dent = match get_or_log_dir_entry(
             result,
             args.stdout_handle(),
+            args.files(),
             args.no_messages(),
         ) {
             None => continue,
             Some(dent) => dent,
         };
-        printer.path(dent.path());
+        if !args.quiet() {
+            printer.path(dent.path());
+        }
         file_count += 1;
     }
     Ok(file_count)
 }
 
-fn run_types(args: Arc<Args>) -> Result<u64> {
+fn run_types(args: &Arc<Args>) -> Result<u64> {
     let stdout = args.stdout();
     let mut printer = args.printer(stdout.lock());
     let mut ty_count = 0;
@@ -247,6 +255,7 @@ fn run_types(args: Arc<Args>) -> Result<u64> {
 fn get_or_log_dir_entry(
     result: result::Result<ignore::DirEntry, ignore::Error>,
     stdout_handle: Option<&same_file::Handle>,
+    files_only: bool,
     no_messages: bool,
 ) -> Option<ignore::DirEntry> {
     match result {
@@ -275,7 +284,7 @@ fn get_or_log_dir_entry(
             }
             // If we are redirecting stdout to a file, then don't search that
             // file.
-            if is_stdout_file(&dent, stdout_handle, no_messages) {
+            if !files_only && is_stdout_file(&dent, stdout_handle, no_messages) {
                 return None;
             }
             Some(dent)
@@ -325,4 +334,23 @@ fn eprint_nothing_searched() {
     eprintln!("No files were searched, which means ripgrep probably \
                applied a filter you didn't expect. \
                Try running again with --debug.");
+}
+
+// The Rust standard library suppresses the default SIGPIPE behavior, so that
+// writing to a closed pipe doesn't kill the process. The goal is to instead
+// handle errors through the normal result mechanism. Ripgrep needs some
+// refactoring before it will be able to do that, however, so we re-enable the
+// standard SIGPIPE behavior as a workaround. See
+// https://github.com/BurntSushi/ripgrep/issues/200.
+#[cfg(unix)]
+fn reset_sigpipe() {
+    extern crate libc;
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn reset_sigpipe() {
+    // no-op
 }
