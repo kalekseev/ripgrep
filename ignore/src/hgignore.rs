@@ -11,42 +11,75 @@ use std::sync::Arc;
 use std::path::Path;
 
 use globset::{Candidate, GlobSetBuilder, GlobSet, GlobBuilder};
-use regex::bytes::Regex;
+use regex::bytes::{Regex, RegexSet};
 use thread_local::ThreadLocal;
 
 use {Error, Match, PartialErrorBuilder};
 use pathutil::{is_file_name, strip_prefix};
 
 
-/// doc
-#[derive(Clone, Debug)]
-pub struct Glob {
+struct TempGlob {
     from: Option<PathBuf>,
     original: String,
     actual: String,
-    is_only_dir: bool,
+    is_only_dir: bool
 }
 
-impl Glob {
+/// doc
+#[derive(Clone, Debug)]
+pub enum Pattern {
+    /// doc
+    Glob {
+        /// doc
+        from: Option<PathBuf>,
+        /// doc
+        original: String,
+        /// doc
+        actual: String,
+        /// doc
+        is_only_dir: bool
+    },
+    /// doc
+    Regex {
+        /// doc
+        from: Option<PathBuf>,
+        /// doc
+        original: String,
+    }
+}
+
+impl Pattern {
     /// Returns the file path that defined this glob.
     pub fn from(&self) -> Option<&Path> {
-        self.from.as_ref().map(|p| &**p)
+        match self {
+            &Pattern::Glob { ref from, .. } => from.as_ref().map(|p| &**p),
+            &Pattern::Regex { ref from, .. } => from.as_ref().map(|p| &**p),
+        }
     }
 
     /// The original glob as it was defined in a gitignore file.
     pub fn original(&self) -> &str {
-        &self.original
+        match self {
+            &Pattern::Glob { ref original, .. } => &original,
+            &Pattern::Regex { ref original, .. } => &original,
+        }
     }
 
     /// The actual glob that was compiled to respect gitignore
     /// semantics.
     pub fn actual(&self) -> &str {
-        &self.actual
+        match self {
+            &Pattern::Glob { ref actual, .. } => &actual,
+            &Pattern::Regex { ref original, .. } => &original,
+        }
     }
 
     /// Whether this glob must match a directory or not.
     pub fn is_only_dir(&self) -> bool {
-        self.is_only_dir
+        match self {
+            &Pattern::Glob { is_only_dir, .. } => is_only_dir,
+            _ => false,
+        }
     }
 }
 
@@ -55,8 +88,10 @@ impl Glob {
 #[derive(Clone, Debug)]
 pub struct Hgignore {
     set: GlobSet,
+    regex_set: RegexSet,
     root: PathBuf,
-    globs: Vec<Glob>,
+    globs: Vec<Pattern>,
+    regexes: Vec<Pattern>,
     num_ignores: u64,
     matches: Arc<ThreadLocal<RefCell<Vec<usize>>>>,
 }
@@ -72,7 +107,7 @@ impl Hgignore {
         let mut errs = PartialErrorBuilder::default();
         errs.maybe_push_ignore_io(builder.add(path));
         match builder.build() {
-            Ok(gi) => (gi, errs.into_error_option()),
+            Ok(hgi) => (hgi, errs.into_error_option()),
             Err(err) => {
                 errs.push(err);
                 (Hgignore::empty(), errs.into_error_option())
@@ -120,7 +155,7 @@ impl Hgignore {
         &self,
         path: P,
         is_dir: bool,
-    ) -> Match<&Glob> {
+    ) -> Match<&Pattern> {
         if self.is_empty() {
             return Match::None;
         }
@@ -132,7 +167,7 @@ impl Hgignore {
         &self,
         path: P,
         is_dir: bool,
-    ) -> Match<&Glob> {
+    ) -> Match<&Pattern> {
         if self.is_empty() {
             return Match::None;
         }
@@ -146,6 +181,12 @@ impl Hgignore {
             if !glob.is_only_dir() || is_dir {
                 return Match::Ignore(glob)
             };
+        }
+        let re_matches = self.regex_set.matches(path.to_str().unwrap().as_bytes());
+        for i in re_matches.iter().rev() {
+            let regex = &self.regexes[i];
+            // println!("matched regex {:#?}", regex);
+            return Match::Ignore(regex)
         }
         Match::None
     }
@@ -194,7 +235,8 @@ pub enum HgignoreSyntax {
 pub struct HgignoreBuilder {
     builder: GlobSetBuilder,
     root: PathBuf,
-    globs: Vec<Glob>,
+    regex_lines: Vec<Pattern>,
+    globs: Vec<Pattern>,
 }
 
 impl HgignoreBuilder {
@@ -204,6 +246,7 @@ impl HgignoreBuilder {
         HgignoreBuilder {
             builder: GlobSetBuilder::new(),
             root: strip_prefix("./", root).unwrap_or(root).to_path_buf(),
+            regex_lines: vec![],
             globs: vec![],
         }
     }
@@ -218,13 +261,16 @@ impl HgignoreBuilder {
                     err: err.to_string(),
                 }
             }));
-        Ok(Hgignore {
+        let rls: Vec<&str> = self.regex_lines.iter().map(|ref x| x.original()).collect();
+        return Ok(Hgignore {
             set: set,
             root: self.root.clone(),
             globs: self.globs.clone(),
+            regex_set: RegexSet::new(rls).unwrap(),
+            regexes: self.regex_lines.clone(),
             num_ignores: nignore as u64,
             matches: Arc::new(ThreadLocal::default()),
-        })
+        });
     }
 
     /// doc
@@ -297,25 +343,11 @@ impl HgignoreBuilder {
         from: Option<PathBuf>,
         line: &str,
     ) -> Result<&mut HgignoreBuilder, Error> {
-        let glob = Glob {
+        // FIXME: validate regex?
+        self.regex_lines.push(Pattern::Regex {
             from: from,
             original: line.to_string(),
-            actual: String::new(),
-            is_only_dir: false,
-        };
-        let parsed = try!(
-            GlobBuilder::new(&line.to_string())
-                // .literal_separator(literal_separator)
-                .from_regex(true)
-                .build()
-                .map_err(|err| {
-                    Error::Glob {
-                        glob: Some(glob.original.clone()),
-                        err: err.kind().to_string(),
-                    }
-                }));
-        self.builder.add(parsed);
-        self.globs.push(glob);
+        });
         Ok(self)
     }
 
@@ -325,7 +357,7 @@ impl HgignoreBuilder {
         from: Option<PathBuf>,
         mut line: &str,
     ) -> Result<&mut HgignoreBuilder, Error> {
-        let mut glob = Glob {
+        let mut glob = TempGlob {
             from: from,
             original: line.to_string(),
             actual: String::new(),
@@ -388,7 +420,12 @@ impl HgignoreBuilder {
                     }
                 }));
         self.builder.add(parsed);
-        self.globs.push(glob);
+        self.globs.push(Pattern::Glob {
+            from: glob.from,
+            original: glob.original,
+            actual: glob.actual,
+            is_only_dir: glob.is_only_dir,
+        });
         Ok(self)
 
     }

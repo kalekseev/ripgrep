@@ -36,7 +36,7 @@ pub struct IgnoreMatch<'a>(IgnoreMatchInner<'a>);
 enum IgnoreMatchInner<'a> {
     Override(overrides::Glob<'a>),
     Gitignore(&'a gitignore::Glob),
-    Hgignore(&'a hgignore::Glob),
+    Hgignore(&'a hgignore::Pattern),
     Types(types::Glob<'a>),
     Hidden,
 }
@@ -50,7 +50,7 @@ impl<'a> IgnoreMatch<'a> {
         IgnoreMatch(IgnoreMatchInner::Gitignore(x))
     }
 
-    fn hgignore(x: &'a hgignore::Glob) -> IgnoreMatch<'a> {
+    fn hgignore(x: &'a hgignore::Pattern) -> IgnoreMatch<'a> {
         IgnoreMatch(IgnoreMatchInner::Hgignore(x))
     }
 
