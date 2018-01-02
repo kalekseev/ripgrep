@@ -102,6 +102,9 @@ pub fn app() -> App<'static, 'static> {
              .value_name("GLOB"))
         .arg(flag("ignore-case").short("i"))
         .arg(flag("line-number").short("n"))
+        .arg(flag("line-number-width")
+             .value_name("NUM").takes_value(true)
+             .validator(validate_line_number_width))
         .arg(flag("no-line-number").short("N").overrides_with("line-number"))
         .arg(flag("quiet").short("q"))
         .arg(flag("type").short("t")
@@ -318,6 +321,11 @@ lazy_static! {
              "Show line numbers.",
              "Show line numbers (1-based). This is enabled by default when \
               searching in a tty.");
+        doc!(h, "line-number-width",
+             "Left pad line numbers upto NUM width.",
+             "Left pad line numbers upto NUM width. Space is used as \
+              the default padding character. This has no effect if \
+              --no-line-number is enabled.");
         doc!(h, "no-line-number",
              "Suppress line numbers.",
              "Suppress line numbers. This is enabled by default when NOT \
@@ -422,12 +430,15 @@ lazy_static! {
               and directories are skipped.");
         doc!(h, "ignore-file",
              "Specify additional ignore files.",
-             "Specify additional ignore files for filtering file paths. \
-              Ignore files should be in the gitignore format and are matched \
-              relative to the current working directory. These ignore files \
-              have lower precedence than all other ignore files. When \
-              specifying multiple ignore files, earlier files have lower \
-              precedence than later files.");
+             "Specify one or more files which contain ignore patterns. \
+              These patterns are applied after the patterns found in \
+              .gitignore and .ignore are applied. Ignore patterns should \
+              be in the gitignore format and are matched relative to the \
+              current working directory. Multiple additional ignore files \
+              can be specified by using the --ignore-file flag several times. \
+              When specifying multiple ignore files, earlier files have lower \
+              precedence than later files. If you are looking for a way to \
+              include or exclude files and directories directly used -g instead.");
         doc!(h, "follow",
              "Follow symbolic links.");
         doc!(h, "max-count",
@@ -570,6 +581,15 @@ lazy_static! {
 
         h
     };
+}
+
+fn validate_line_number_width(s: String) -> Result<(), String> {
+    if s.starts_with("0") {
+        Err(String::from("Custom padding characters are currently not supported. \
+        Please enter only a numeric value."))
+    } else {
+        validate_number(s)
+    }
 }
 
 fn validate_number(s: String) -> Result<(), String> {

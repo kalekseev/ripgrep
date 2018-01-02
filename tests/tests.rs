@@ -62,7 +62,7 @@ fn paths(unix: &[&str]) -> Vec<String> {
 
 fn paths_from_stdout(stdout: String) -> Vec<String> {
     let mut paths: Vec<_> = stdout.lines().map(|s| {
-        s.split(":").next().unwrap().to_string()
+        s.split(':').next().unwrap().to_string()
     }).collect();
     paths.sort();
     paths
@@ -101,6 +101,22 @@ sherlock!(line_numbers, |wd: WorkDir, mut cmd: Command| {
 3:be, to a very large extent, the result of luck. Sherlock Holmes
 ";
     assert_eq!(lines, expected);
+});
+
+sherlock!(line_number_width, |wd: WorkDir, mut cmd: Command| {
+    cmd.arg("-n");
+    cmd.arg("--line-number-width").arg("2");
+    let lines: String = wd.stdout(&mut cmd);
+    let expected = " 1:For the Doctor Watsons of this world, as opposed to the Sherlock
+ 3:be, to a very large extent, the result of luck. Sherlock Holmes
+";
+    assert_eq!(lines, expected);
+});
+
+sherlock!(line_number_width_padding_character_error, |wd: WorkDir, mut cmd: Command| {
+    cmd.arg("-n");
+    cmd.arg("--line-number-width").arg("02");
+    wd.assert_non_empty_stderr(&mut cmd);
 });
 
 sherlock!(columns, |wd: WorkDir, mut cmd: Command| {
@@ -1581,6 +1597,16 @@ sherlock!(feature_419_zero_as_shortcut_for_null, "Sherlock", ".",
 
     let lines: String = wd.stdout(&mut cmd);
     assert_eq!(lines, "sherlock\x002\n");
+});
+
+// See: https://github.com/BurntSushi/ripgrep/issues/709
+clean!(suggest_fixed_strings_for_invalid_regex, "foo(", ".",
+|wd: WorkDir, mut cmd: Command| {
+    wd.assert_non_empty_stderr(&mut cmd);
+
+    let output = cmd.output().unwrap();
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(err.contains("--fixed-strings"), true);
 });
 
 #[test]
