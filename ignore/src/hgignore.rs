@@ -18,13 +18,6 @@ use {Error, Match, PartialErrorBuilder};
 use pathutil::{is_file_name, strip_prefix};
 
 
-struct TempGlob {
-    from: Option<PathBuf>,
-    original: String,
-    actual: String,
-    is_only_dir: bool
-}
-
 /// doc
 #[derive(Clone, Debug)]
 pub enum Pattern {
@@ -57,7 +50,7 @@ impl Pattern {
         }
     }
 
-    /// The original glob as it was defined in a gitignore file.
+    /// The original pattern as it was defined in a hgignore file.
     pub fn original(&self) -> &str {
         match self {
             &Pattern::Glob { ref original, .. } => &original,
@@ -65,7 +58,7 @@ impl Pattern {
         }
     }
 
-    /// The actual glob that was compiled to respect gitignore
+    /// The actual pattern that was compiled to respect hgignore
     /// semantics.
     pub fn actual(&self) -> &str {
         match self {
@@ -74,7 +67,7 @@ impl Pattern {
         }
     }
 
-    /// Whether this glob must match a directory or not.
+    /// Whether this pattern must match a directory or not.
     pub fn is_only_dir(&self) -> bool {
         match self {
             &Pattern::Glob { is_only_dir, .. } => is_only_dir,
@@ -134,13 +127,13 @@ impl Hgignore {
         HgignoreBuilder::new("").build().unwrap()
     }
 
-    /// Returns true if and only if this gitignore has zero globs, and
+    /// Returns true if and only if this hgignore has zero patterns, and
     /// therefore never matches any file path.
     pub fn is_empty(&self) -> bool {
-        self.set.is_empty()
+        self.set.is_empty() && self.regex_set.len() == 0
     }
 
-    /// Returns whether the given file path matched a pattern in this gitignore
+    /// Returns whether the given file path matched a pattern in this hgignore
     /// matcher.
     ///
     /// `is_dir` should be true if the path refers to a directory and false
@@ -149,7 +142,7 @@ impl Hgignore {
     /// The given path is matched relative to the path given when building
     /// the matcher. Specifically, before matching `path`, its prefix (as
     /// determined by a common suffix of the directory containing this
-    /// gitignore) is stripped. If there is no common suffix/prefix overlap,
+    /// hgignore) is stripped. If there is no common suffix/prefix overlap,
     /// then `path` is assumed to be relative to this matcher.
     pub fn matched<P: AsRef<Path>>(
         &self,
@@ -168,25 +161,27 @@ impl Hgignore {
         path: P,
         is_dir: bool,
     ) -> Match<&Pattern> {
-        if self.is_empty() {
-            return Match::None;
+        if !self.set.is_empty() {
+            let path = path.as_ref();
+            let candidate = Candidate::new(path);
+            let _matches = self.matches.get_default();
+            let mut matches = _matches.borrow_mut();
+            self.set.matches_candidate_into(&candidate, &mut *matches);
+            for &i in matches.iter().rev() {
+                let glob = &self.globs[i];
+                if !glob.is_only_dir() || is_dir {
+                    return Match::Ignore(glob)
+                }
+            }
         }
-        let path = path.as_ref();
-        let _matches = self.matches.get_default();
-        let mut matches = _matches.borrow_mut();
-        let candidate = Candidate::new(path);
-        self.set.matches_candidate_into(&candidate, &mut *matches);
-        for &i in matches.iter().rev() {
-            let glob = &self.globs[i];
-            if !glob.is_only_dir() || is_dir {
-                return Match::Ignore(glob)
+        if self.regex_set.len() != 0 {
+            let path = path.as_ref();
+            let candidate = Candidate::new(path);
+            let re_matches = self.regex_set.matches(&*candidate.path);
+            match re_matches.iter().next() {
+                Some(i) => return Match::Ignore(&self.regexes[i]),
+                None => return Match::None,
             };
-        }
-        let re_matches = self.regex_set.matches(path.to_str().unwrap().as_bytes());
-        for i in re_matches.iter().rev() {
-            let regex = &self.regexes[i];
-            // println!("matched regex {:#?}", regex);
-            return Match::Ignore(regex)
         }
         Match::None
     }
@@ -199,13 +194,13 @@ impl Hgignore {
     ) -> &'a Path {
         let mut path = path.as_ref();
         // A leading ./ is completely superfluous. We also strip it from
-        // our gitignore root path, so we need to strip it from our candidate
+        // our hgignore root path, so we need to strip it from our candidate
         // path too.
         if let Some(p) = strip_prefix("./", path) {
             path = p;
         }
         // Strip any common prefix between the candidate path and the root
-        // of the gitignore, to make sure we get relative matching right.
+        // of the hgignore, to make sure we get relative matching right.
         // BUT, a file name might not have any directory components to it,
         // in which case, we don't want to accidentally strip any part of the
         // file name.
@@ -253,7 +248,6 @@ impl HgignoreBuilder {
 
     /// doc
     pub fn build(&self) -> Result<Hgignore, Error> {
-        let nignore = self.globs.iter().count();
         let set = try!(
             self.builder.build().map_err(|err| {
                 Error::Glob {
@@ -261,7 +255,11 @@ impl HgignoreBuilder {
                     err: err.to_string(),
                 }
             }));
-        let rls: Vec<&str> = self.regex_lines.iter().map(|ref x| x.original()).collect();
+        let rls: Vec<&str> = self.regex_lines
+            .iter()
+            .map(|ref x| x.original())
+            .collect();
+        let nignore = self.globs.iter().count() + rls.iter().count();
         return Ok(Hgignore {
             set: set,
             root: self.root.clone(),
@@ -276,7 +274,7 @@ impl HgignoreBuilder {
     /// doc
     pub fn add<P: AsRef<Path>>(&mut self, path: P) -> Option<Error> {
         lazy_static! {
-            static ref RE: Regex = Regex::new(
+            static ref SYNTAX_SWITCH: Regex = Regex::new(
                 r"^syntax:\s*(regexp|glob)\s*$").unwrap();
         };
         let mut current_syntax = HgignoreSyntax::Regexp;
@@ -296,7 +294,7 @@ impl HgignoreBuilder {
                     break;
                 }
             };
-            match RE.captures(line.as_bytes()) {
+            match SYNTAX_SWITCH.captures(line.as_bytes()) {
                 None => {
                     if let Err(err) = self.add_line(
                         Some(path.to_path_buf()), &line, current_syntax
@@ -325,15 +323,40 @@ impl HgignoreBuilder {
         if line.starts_with("#") {
             return Ok(self);
         }
-        if !line.ends_with("\\ ") {
-            line = line.trim_right();
-        }
+        line = line.trim_right();
         if line.is_empty() {
             return Ok(self);
         }
-        match current_syntax {
-            HgignoreSyntax::Glob => self.add_glob_line(from, line),
-            HgignoreSyntax::Regexp => self.add_regex_line(from, line),
+        // TODO: extended patterns support, see hg help patterns
+        lazy_static! {
+            static ref EXT_PATTERN: Regex = Regex::new(r"^(\w+):").unwrap();
+        };
+        match EXT_PATTERN.captures(line.as_bytes()) {
+            Some(caps) => {
+                match &caps[1] {
+                    b"path" => debug!("HG pattern \"path:\" is not supported."),
+                    b"rootfilesin" => debug!("HG pattern \"rootfilesin:\" is not supported."),
+                    b"glob" => debug!("HG pattern \"glob:\" is not supported."),
+                    b"re" => debug!("HG pattern \"re:\" is not supported."),
+                    b"listfile" => debug!("HG pattern \"listfile:\" is not supported."),
+                    b"listfile0" => debug!("HG pattern \"listfile0:\" is not supported."),
+                    b"include" => debug!("HG pattern \"include:\" is not supported."),
+                    b"subinclude" => debug!("HG pattern \"subinclude:\" is not supported."),
+                    _ => {
+                        return match current_syntax {
+                            HgignoreSyntax::Glob => self.add_glob_line(from, line),
+                            HgignoreSyntax::Regexp => self.add_regex_line(from, line),
+                        }
+                    },
+                }
+                return Ok(self);
+            },
+            None => {
+                match current_syntax {
+                    HgignoreSyntax::Glob => self.add_glob_line(from, line),
+                    HgignoreSyntax::Regexp => self.add_regex_line(from, line),
+                }
+            },
         }
     }
 
@@ -343,7 +366,10 @@ impl HgignoreBuilder {
         from: Option<PathBuf>,
         line: &str,
     ) -> Result<&mut HgignoreBuilder, Error> {
-        // FIXME: validate regex?
+        // FIXME: validate regex otherwise RegexSet build will
+        // fail. So we have to create regexes twice:
+        // during validation and during RegexSet build.
+        // Another option is to use list of regexes instead of RegexSet
         self.regex_lines.push(Pattern::Regex {
             from: from,
             original: line.to_string(),
@@ -357,12 +383,10 @@ impl HgignoreBuilder {
         from: Option<PathBuf>,
         mut line: &str,
     ) -> Result<&mut HgignoreBuilder, Error> {
-        let mut glob = TempGlob {
-            from: from,
-            original: line.to_string(),
-            actual: String::new(),
-            is_only_dir: false,
-        };
+        let mut actual;
+        let mut is_only_dir = false;
+        let original = line.to_string();
+
         let mut literal_separator = false;
         let has_slash = line.chars().any(|c| c == '/');
         let mut is_absolute = false;
@@ -370,6 +394,7 @@ impl HgignoreBuilder {
             line = &line[1..];
             is_absolute = line.chars().nth(0) == Some('/');
         } else {
+            // FIXME: this is not the case for hgignore
             if line.starts_with("/") {
                 // `man gitignore` says that if a glob starts with a slash,
                 // then the glob can only match the beginning of a path
@@ -384,13 +409,13 @@ impl HgignoreBuilder {
         // but the slash should otherwise not be used while globbing.
         if let Some((i, c)) = line.char_indices().rev().nth(0) {
             if c == '/' {
-                glob.is_only_dir = true;
+                is_only_dir = true;
                 line = &line[..i];
             }
         }
         // If there is a literal slash, then we note that so that globbing
         // doesn't let wildcards match slashes.
-        glob.actual = line.to_string();
+        actual = line.to_string();
         if has_slash {
             literal_separator = true;
         }
@@ -399,126 +424,71 @@ impl HgignoreBuilder {
         // anywhere, so use a **/ prefix.
         if !is_absolute {
             // ... but only if we don't already have a **/ prefix.
-            if !glob.actual.starts_with("**/") {
-                glob.actual = format!("**/{}", glob.actual);
+            if !actual.starts_with("**/") {
+                actual = format!("**/{}", actual);
             }
         }
         // If the glob ends with `/**`, then we should only match everything
         // inside a directory, but not the directory itself. Standard globs
         // will match the directory. So we add `/*` to force the issue.
-        if glob.actual.ends_with("/**") {
-            glob.actual = format!("{}/*", glob.actual);
+        if actual.ends_with("/**") {
+            actual = format!("{}/*", actual);
         }
         let parsed = try!(
-            GlobBuilder::new(&glob.actual)
+            GlobBuilder::new(&actual)
                 .literal_separator(literal_separator)
                 .build()
                 .map_err(|err| {
                     Error::Glob {
-                        glob: Some(glob.original.clone()),
+                        glob: Some(original.clone()),
                         err: err.kind().to_string(),
                     }
                 }));
         self.builder.add(parsed);
         self.globs.push(Pattern::Glob {
-            from: glob.from,
-            original: glob.original,
-            actual: glob.actual,
-            is_only_dir: glob.is_only_dir,
+            from: from,
+            original: original,
+            actual: actual,
+            is_only_dir: is_only_dir,
         });
         Ok(self)
 
     }
 }
 
-/*
- * TODO:
- *   Global configuration like the username setting is typically put into:
- *
- *       o %USERPROFILE%\mercurial.ini (on Windows)
- *
- *       o $HOME/.hgrc (on Unix, Plan9)
- *
- *       The names of these files depend on the system on which Mercurial is installed. \*.rc files from a
- *       single  directory are read in alphabetical order, later ones overriding earlier ones. Where mul-
- *       tiple paths are given below, settings from earlier paths override later ones.
- *
- *       On Unix, the following files are consulted:
- *
- *       o <repo>/.hg/hgrc (per-repository)
- *
- *       o $HOME/.hgrc (per-user)
- *
- *       o <install-root>/etc/mercurial/hgrc (per-installation)
- *
- *       o <install-root>/etc/mercurial/hgrc.d/\*.rc (per-installation)
- *
- *       o /etc/mercurial/hgrc (per-system)
- *
- *       o /etc/mercurial/hgrc.d/\*.rc (per-system)
- *
- *       o <internal>/default.d/\*.rc (defaults)
- *
- *       On Windows, the following files are consulted:
- *
- *       o <repo>/.hg/hgrc (per-repository)
- *
- *       o %USERPROFILE%\.hgrc (per-user)
- *
- *       o %USERPROFILE%\Mercurial.ini (per-user)
- *
- *       o %HOME%\.hgrc (per-user)
- *
- *       o %HOME%\Mercurial.ini (per-user)
- *
- *       o HKEY_LOCAL_MACHINE\SOFTWARE\Mercurial (per-installation)
- *
- *       o <install-dir>\hgrc.d\*.rc (per-installation)
- *
- *       o <install-dir>\Mercurial.ini (per-installation)
- *
- *       o <internal>/default.d/\*.rc (defaults)
- *      Note   The registry key HKEY_LOCAL_MACHINE\SOFTWARE\Wow6432Node\Mercurial is used  when  running
- *              32-bit Python on 64-bit Windows.
- *
- *       On Windows 9x, %HOME% is replaced by %APPDATA%.
- *
- *       On Plan9, the following files are consulted:
- *
- *       o <repo>/.hg/hgrc (per-repository)
- *
- *       o $home/lib/hgrc (per-user)
- *
- *       o <install-root>/lib/mercurial/hgrc (per-installation)
- *
- *       o <install-root>/lib/mercurial/hgrc.d/\*.rc (per-installation)
- *
- *       o /lib/mercurial/hgrc (per-system)
- *
- *       o /lib/mercurial/hgrc.d/\*.rc (per-system)
- *
- *       o <internal>/default.d/\*.rc (defaults)
- */
-/// FIXME: parses only ignore setting from $HOME/.hgrc
 fn hgrc_ignore_path() -> Option<PathBuf> {
     hgrc_contents()
         .and_then(|data| parse_ignore_file(&data))
 }
 
-fn hgrc_contents() -> Option<Vec<u8>> {
-    let home = match env::var_os("HOME") {
-        None => return None,
-        Some(home) => PathBuf::from(home),
-    };
-    let mut file = match File::open(home.join(".hgrc")) {
-        Err(_) => return None,
-        Ok(file) => io::BufReader::new(file),
-    };
-    let mut contents = vec![];
-    file.read_to_end(&mut contents).ok().map(|_| contents)
+/// Provides paths to per-user mercurial configs
+/// TODO: return $HOME/Mercurial.ini only on windows
+fn per_user_configs() -> Vec<PathBuf> {
+    let configs = [".hgrc", "Mercurial.ini"];
+    let mut result = vec![];
+    if let Some(home) = env::home_dir() {
+        for config in configs.iter() {
+            let mut chome = home.clone();
+            chome.push(config);
+            result.push(chome);
+        }
+    }
+    result
 }
 
+fn hgrc_contents() -> Option<Vec<u8>> {
+    per_user_configs()
+        .iter()
+        .flat_map(|c| File::open(c).ok())
+        .map(|f| io::BufReader::new(f))
+        .flat_map(|mut br| {
+            let mut contents = vec![];
+            br.read_to_end(&mut contents).ok().map(|_| contents)
+        })
+        .next()
+}
 
+// TODO: parse only [ui] section
 fn parse_ignore_file(data: &[u8]) -> Option<PathBuf> {
     lazy_static! {
         static ref RE: Regex = Regex::new(
@@ -531,11 +501,13 @@ fn parse_ignore_file(data: &[u8]) -> Option<PathBuf> {
     str::from_utf8(&caps[1]).ok().map(|s| PathBuf::from(expand_tilde(s)))
 }
 
-/// Expands ~ in file paths to the value of $HOME.
+/// Expands `~/` in file paths to the value of $HOME.
 fn expand_tilde(path: &str) -> String {
-    let home = match env::var("HOME") {
-        Err(_) => return path.to_string(),
-        Ok(home) => home,
+    // TODO: we don't handle `~username` shortcuts
+    let expanded_path = if path.starts_with("~/") {
+        env::home_dir().map(|home| path.replacen("~", home.to_str().unwrap(), 1))
+    } else {
+        None
     };
-    path.replace("~", &home)
+    expanded_path.unwrap_or(path.to_string())
 }

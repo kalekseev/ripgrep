@@ -495,11 +495,11 @@ impl IgnoreBuilder {
             if !self.opts.hg_global {
                 Hgignore::empty()
             } else {
-                let (gi, err) = Hgignore::global();
+                let (hgi, err) = Hgignore::global();
                 if let Some(err) = err {
                     debug!("{}", err);
                 }
-                gi
+                hgi
             };
         Ignore(Arc::new(IgnoreInner {
             compiled: Arc::new(RwLock::new(HashMap::new())),
@@ -663,6 +663,7 @@ pub fn create_hgignore(
 
 #[cfg(test)]
 mod tests {
+    use std::env;
     use std::fs::{self, File};
     use std::io::Write;
     use std::path::Path;
@@ -950,5 +951,21 @@ mod tests {
         assert!(ig2.matched("foo.file", false).is_ignore());
         assert!(ig2.matched("subdir/foo.file", false).is_ignore());
         assert!(ig2.matched("subdir/bar.file", false).is_none());
+    }
+
+    #[test]
+    fn hgignore_global() {
+        let td = TempDir::new("ignore-test-").unwrap();
+        env::set_var("HOME", td.path());
+        mkdirp(td.path().join("repo"));
+        mkdirp(td.path().join("repo/.hg"));
+        wfile(td.path().join(".hgrc"), "[ui]\nignore = ~/global_hgignore");
+        wfile(td.path().join("global_hgignore"), "foo$\nsyntax: glob\nbar");
+
+        let (ig, err) = IgnoreBuilder::new().build().add_child(td.path().join("repo"));
+        assert!(err.is_none());
+        assert!(ig.matched("foo", false).is_ignore());
+        assert!(ig.matched("bar", false).is_ignore());
+        assert!(ig.matched("food", false).is_none());
     }
 }
