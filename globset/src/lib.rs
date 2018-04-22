@@ -91,6 +91,11 @@ Standard Unix-style glob syntax is supported:
   `[!ab]` to match any character except for `a` and `b`.
 * Metacharacters such as `*` and `?` can be escaped with character class
   notation. e.g., `[*]` matches `*`.
+* When backslash escapes are enabled, a backslash (`\`) will escape all meta
+  characters in a glob. If it precedes a non-meta character, then the slash is
+  ignored. A `\\` will match a literal `\\`. Note that this mode is only
+  enabled on Unix platforms by default, but can be enabled on any platform
+  via the `backslash_escape` setting on `Glob`.
 
 A `GlobBuilder` can be used to prevent wildcards from matching path separators,
 or to enable case insensitive matching.
@@ -108,7 +113,7 @@ extern crate regex;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error as StdError;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::fmt;
 use std::hash;
 use std::path::Path;
@@ -154,8 +159,17 @@ pub enum ErrorKind {
     /// Occurs when an alternating group is nested inside another alternating
     /// group, e.g., `{{a,b},{c,d}}`.
     NestedAlternates,
+    /// Occurs when an unescaped '\' is found at the end of a glob.
+    DanglingEscape,
     /// An error associated with parsing or compiling a regex.
     Regex(String),
+    /// Hints that destructuring should not be exhaustive.
+    ///
+    /// This enum may grow additional variants, so this makes sure clients
+    /// don't count on exhaustive matching. (Otherwise, adding a new variant
+    /// could break existing code.)
+    #[doc(hidden)]
+    __Nonexhaustive,
 }
 
 impl StdError for Error {
@@ -199,7 +213,11 @@ impl ErrorKind {
             ErrorKind::NestedAlternates => {
                 "nested alternate groups are not allowed"
             }
+            ErrorKind::DanglingEscape => {
+                "dangling '\\'"
+            }
             ErrorKind::Regex(ref err) => err,
+            ErrorKind::__Nonexhaustive => unreachable!(),
         }
     }
 }
@@ -223,12 +241,14 @@ impl fmt::Display for ErrorKind {
             | ErrorKind::UnopenedAlternates
             | ErrorKind::UnclosedAlternates
             | ErrorKind::NestedAlternates
+            | ErrorKind::DanglingEscape
             | ErrorKind::Regex(_) => {
                 write!(f, "{}", self.description())
             }
             ErrorKind::InvalidRange(s, e) => {
                 write!(f, "invalid range; '{}' > '{}'", s, e)
             }
+            ErrorKind::__Nonexhaustive => unreachable!(),
         }
     }
 }
@@ -421,6 +441,7 @@ impl GlobSet {
 
 /// GlobSetBuilder builds a group of patterns that can be used to
 /// simultaneously match a file path.
+#[derive(Clone, Debug)]
 pub struct GlobSetBuilder {
     pats: Vec<Glob>,
 }
@@ -459,7 +480,7 @@ pub struct Candidate<'a> {
     /// FIXME: hgignore only needs path, we can build it by hands
     pub path: Cow<'a, [u8]>,
     basename: Cow<'a, [u8]>,
-    ext: &'a OsStr,
+    ext: Cow<'a, [u8]>,
 }
 
 impl<'a> Candidate<'a> {
@@ -470,7 +491,7 @@ impl<'a> Candidate<'a> {
         Candidate {
             path: normalize_path(path_bytes(path)),
             basename: os_str_bytes(basename),
-            ext: file_name_ext(basename).unwrap_or(OsStr::new("")),
+            ext: file_name_ext(basename).unwrap_or(Cow::Borrowed(b"")),
         }
     }
 
@@ -585,22 +606,22 @@ impl BasenameLiteralStrategy {
 }
 
 #[derive(Clone, Debug)]
-struct ExtensionStrategy(HashMap<OsString, Vec<usize>, Fnv>);
+struct ExtensionStrategy(HashMap<Vec<u8>, Vec<usize>, Fnv>);
 
 impl ExtensionStrategy {
     fn new() -> ExtensionStrategy {
         ExtensionStrategy(HashMap::with_hasher(Fnv::default()))
     }
 
-    fn add(&mut self, global_index: usize, ext: OsString) {
-        self.0.entry(ext).or_insert(vec![]).push(global_index);
+    fn add(&mut self, global_index: usize, ext: String) {
+        self.0.entry(ext.into_bytes()).or_insert(vec![]).push(global_index);
     }
 
     fn is_match(&self, candidate: &Candidate) -> bool {
         if candidate.ext.is_empty() {
             return false;
         }
-        self.0.contains_key(candidate.ext)
+        self.0.contains_key(&*candidate.ext)
     }
 
     #[inline(never)]
@@ -608,7 +629,7 @@ impl ExtensionStrategy {
         if candidate.ext.is_empty() {
             return;
         }
-        if let Some(hits) = self.0.get(candidate.ext) {
+        if let Some(hits) = self.0.get(&*candidate.ext) {
             matches.extend(hits);
         }
     }
@@ -671,14 +692,14 @@ impl SuffixStrategy {
 }
 
 #[derive(Clone, Debug)]
-struct RequiredExtensionStrategy(HashMap<OsString, Vec<(usize, Regex)>, Fnv>);
+struct RequiredExtensionStrategy(HashMap<Vec<u8>, Vec<(usize, Regex)>, Fnv>);
 
 impl RequiredExtensionStrategy {
     fn is_match(&self, candidate: &Candidate) -> bool {
         if candidate.ext.is_empty() {
             return false;
         }
-        match self.0.get(candidate.ext) {
+        match self.0.get(&*candidate.ext) {
             None => false,
             Some(regexes) => {
                 for &(_, ref re) in regexes {
@@ -696,7 +717,7 @@ impl RequiredExtensionStrategy {
         if candidate.ext.is_empty() {
             return;
         }
-        if let Some(regexes) = self.0.get(candidate.ext) {
+        if let Some(regexes) = self.0.get(&*candidate.ext) {
             for &(global_index, ref re) in regexes {
                 if re.is_match(&*candidate.path) {
                     matches.push(global_index);
@@ -776,7 +797,7 @@ impl MultiStrategyBuilder {
 
 #[derive(Clone, Debug)]
 struct RequiredExtensionStrategyBuilder(
-    HashMap<OsString, Vec<(usize, String)>>,
+    HashMap<Vec<u8>, Vec<(usize, String)>>,
 );
 
 impl RequiredExtensionStrategyBuilder {
@@ -784,8 +805,11 @@ impl RequiredExtensionStrategyBuilder {
         RequiredExtensionStrategyBuilder(HashMap::new())
     }
 
-    fn add(&mut self, global_index: usize, ext: OsString, regex: String) {
-        self.0.entry(ext).or_insert(vec![]).push((global_index, regex));
+    fn add(&mut self, global_index: usize, ext: String, regex: String) {
+        self.0
+            .entry(ext.into_bytes())
+            .or_insert(vec![])
+            .push((global_index, regex));
     }
 
     fn build(self) -> Result<RequiredExtensionStrategy, Error> {

@@ -3,15 +3,13 @@ use std::env;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, BufRead};
-use std::ops;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use clap;
 use encoding_rs::Encoding;
-use env_logger;
-use grep::{Grep, GrepBuilder, Error as GrepError};
+use grep::{Grep, GrepBuilder};
 use log;
 use num_cpus;
 use regex;
@@ -27,6 +25,8 @@ use printer::{ColorSpecs, Printer};
 use unescape::unescape;
 use worker::{Worker, WorkerBuilder};
 
+use config;
+use logger::Logger;
 use Result;
 
 /// `Args` are transformed/normalized from `ArgMatches`.
@@ -35,11 +35,13 @@ pub struct Args {
     paths: Vec<PathBuf>,
     after_context: usize,
     before_context: usize,
+    byte_offset: bool,
     color_choice: termcolor::ColorChoice,
     colors: ColorSpecs,
     column: bool,
     context_separator: Vec<u8>,
     count: bool,
+    count_matches: bool,
     encoding: Option<&'static Encoding>,
     files_with_matches: bool,
     files_without_matches: bool,
@@ -77,6 +79,8 @@ pub struct Args {
     type_list: bool,
     types: Types,
     with_filename: bool,
+    search_zip_files: bool,
+    stats: bool
 }
 
 impl Args {
@@ -88,18 +92,59 @@ impl Args {
     ///
     /// Also, initialize a global logger.
     pub fn parse() -> Result<Args> {
-        let matches = app::app().get_matches();
+        // We parse the args given on CLI. This does not include args from
+        // the config. We use the CLI args as an initial configuration while
+        // trying to parse config files. If a config file exists and has
+        // arguments, then we re-parse argv, otherwise we just use the matches
+        // we have here.
+        let early_matches = ArgMatches(app::app().get_matches());
 
-        let mut logb = env_logger::LogBuilder::new();
-        if matches.is_present("debug") {
-            logb.filter(None, log::LogLevelFilter::Debug);
-        } else {
-            logb.filter(None, log::LogLevelFilter::Warn);
-        }
-        if let Err(err) = logb.init() {
+        if let Err(err) = Logger::init() {
             errored!("failed to initialize logger: {}", err);
         }
-        ArgMatches(matches).to_args()
+        if early_matches.is_present("debug") {
+            log::set_max_level(log::LevelFilter::Debug);
+        } else {
+            log::set_max_level(log::LevelFilter::Warn);
+        }
+
+        let matches = Args::matches(early_matches);
+        // The logging level may have changed if we brought in additional
+        // arguments from a configuration file, so recheck it and set the log
+        // level as appropriate.
+        if matches.is_present("debug") {
+            log::set_max_level(log::LevelFilter::Debug);
+        } else {
+            log::set_max_level(log::LevelFilter::Warn);
+        }
+        matches.to_args()
+    }
+
+    /// Run clap and return the matches. If clap determines a problem with the
+    /// user provided arguments (or if --help or --version are given), then an
+    /// error/usage/version will be printed and the process will exit.
+    ///
+    /// If there are no additional arguments from the environment (e.g., a
+    /// config file), then the given matches are returned as is.
+    fn matches(early_matches: ArgMatches<'static>) -> ArgMatches<'static> {
+        // If the end user says no config, then respect it.
+        if early_matches.is_present("no-config") {
+            debug!("not reading config files because --no-config is present");
+            return early_matches;
+        }
+        // If the user wants ripgrep to use a config file, then parse args
+        // from that first.
+        let mut args = config::args(early_matches.is_present("no-messages"));
+        if args.is_empty() {
+            return early_matches;
+        }
+        let mut cliargs = env::args_os();
+        if let Some(bin) = cliargs.next() {
+            args.insert(0, bin);
+        }
+        args.extend(cliargs);
+        debug!("final argv: {:?}", args);
+        ArgMatches(app::app().get_matches_from(args))
     }
 
     /// Returns true if ripgrep should print the files it will search and exit
@@ -157,6 +202,7 @@ impl Args {
     pub fn file_separator(&self) -> Option<Vec<u8>> {
         let contextless =
             self.count
+            || self.count_matches
             || self.files_with_matches
             || self.files_without_matches;
         let use_heading_sep = self.heading && !contextless;
@@ -174,6 +220,12 @@ impl Args {
     /// Returns true if the given arguments are known to never produce a match.
     pub fn never_match(&self) -> bool {
         self.max_count == Some(0)
+    }
+
+
+    /// Returns whether ripgrep should track stats for this run
+    pub fn stats(&self) -> bool {
+        self.stats
     }
 
     /// Create a new writer for single-threaded searching with color support.
@@ -208,7 +260,7 @@ impl Args {
     /// Returns true if there is exactly one file path given to search.
     pub fn is_one_path(&self) -> bool {
         self.paths.len() == 1
-        && (self.paths[0] == Path::new("-") || self.paths[0].is_file())
+        && (self.paths[0] == Path::new("-") || path_is_file(&self.paths[0]))
     }
 
     /// Create a worker whose configuration is taken from the
@@ -217,7 +269,9 @@ impl Args {
         WorkerBuilder::new(self.grep())
             .after_context(self.after_context)
             .before_context(self.before_context)
+            .byte_offset(self.byte_offset)
             .count(self.count)
+            .count_matches(self.count_matches)
             .encoding(self.encoding)
             .files_with_matches(self.files_with_matches)
             .files_without_matches(self.files_without_matches)
@@ -229,6 +283,7 @@ impl Args {
             .no_messages(self.no_messages)
             .quiet(self.quiet)
             .text(self.text)
+            .search_zip_files(self.search_zip_files)
             .build()
     }
 
@@ -290,6 +345,9 @@ impl Args {
         wd.hg_global(!self.no_ignore && !self.no_ignore_vcs);
         wd.hg_ignore(!self.no_ignore && !self.no_ignore_vcs);
         wd.ignore(!self.no_ignore);
+        if !self.no_ignore {
+            wd.add_custom_ignore_filename(".rgignore");
+        }
         wd.parents(!self.no_ignore_parent);
         wd.threads(self.threads());
         if self.sort_files {
@@ -303,11 +361,6 @@ impl Args {
 /// several options/flags.
 struct ArgMatches<'a>(clap::ArgMatches<'a>);
 
-impl<'a> ops::Deref for ArgMatches<'a> {
-    type Target = clap::ArgMatches<'a>;
-    fn deref(&self) -> &clap::ArgMatches<'a> { &self.0 }
-}
-
 impl<'a> ArgMatches<'a> {
     /// Convert the result of parsing CLI arguments into ripgrep's
     /// configuration.
@@ -317,16 +370,19 @@ impl<'a> ArgMatches<'a> {
         let mmap = self.mmap(&paths)?;
         let with_filename = self.with_filename(&paths);
         let (before_context, after_context) = self.contexts()?;
+        let (count, count_matches) = self.counts();
         let quiet = self.is_present("quiet");
         let args = Args {
             paths: paths,
             after_context: after_context,
             before_context: before_context,
+            byte_offset: self.is_present("byte-offset"),
             color_choice: self.color_choice(),
             colors: self.color_specs()?,
             column: self.column(),
             context_separator: self.context_separator(),
-            count: self.is_present("count"),
+            count: count,
+            count_matches: count_matches,
             encoding: self.encoding()?,
             files_with_matches: self.is_present("files-with-matches"),
             files_without_matches: self.is_present("files-without-match"),
@@ -342,8 +398,8 @@ impl<'a> ArgMatches<'a> {
             line_number: line_number,
             line_number_width: try!(self.usize_of("line-number-width")),
             line_per_match: self.is_present("vimgrep"),
-            max_columns: self.usize_of("max-columns")?,
-            max_count: self.usize_of("max-count")?.map(|max| max as u64),
+            max_columns: self.usize_of_nonzero("max-columns")?,
+            max_count: self.usize_of("max-count")?.map(|n| n as u64),
             max_filesize: self.max_filesize()?,
             maxdepth: self.usize_of("maxdepth")?,
             mmap: mmap,
@@ -364,6 +420,8 @@ impl<'a> ArgMatches<'a> {
             type_list: self.is_present("type-list"),
             types: self.types()?,
             with_filename: with_filename,
+            search_zip_files: self.is_present("search-zip"),
+            stats: self.stats()
         };
         if args.mmap {
             debug!("will try to use memory maps");
@@ -382,7 +440,7 @@ impl<'a> ArgMatches<'a> {
         if self.is_present("file")
             || self.is_present("files")
             || self.is_present("regexp") {
-            if let Some(path) = self.value_of_os("PATTERN") {
+            if let Some(path) = self.value_of_os("pattern") {
                 paths.insert(0, Path::new(path).to_path_buf());
             }
         }
@@ -435,7 +493,9 @@ impl<'a> ArgMatches<'a> {
     /// Note that if -F/--fixed-strings is set, then all patterns will be
     /// escaped. Similarly, if -w/--word-regexp is set, then all patterns
     /// are surrounded by `\b`, and if -x/--line-regexp is set, then all
-    /// patterns are surrounded by `^...$`.
+    /// patterns are surrounded by `^...$`. Finally, if --passthru is set,
+    /// the pattern `^` is added to the end (to ensure that it works as
+    /// expected with multiple -e/-f patterns).
     ///
     /// If any pattern is invalid UTF-8, then an error is returned.
     fn patterns(&self) -> Result<Vec<String>> {
@@ -446,7 +506,7 @@ impl<'a> ArgMatches<'a> {
         match self.values_of_os("regexp") {
             None => {
                 if self.values_of_os("file").is_none() {
-                    if let Some(os_pat) = self.value_of_os("PATTERN") {
+                    if let Some(os_pat) = self.value_of_os("pattern") {
                         pats.push(self.os_str_pattern(os_pat)?);
                     }
                 }
@@ -472,7 +532,11 @@ impl<'a> ArgMatches<'a> {
                 }
             }
         }
-        if pats.is_empty() {
+        // It's important that this be at the end; otherwise it would always
+        // match first, and we wouldn't get colours in the output
+        if self.is_present("passthru") && !self.is_present("count") {
+            pats.push("^".to_string())
+        } else if pats.is_empty() {
             pats.push(self.empty_pattern())
         }
         Ok(pats)
@@ -537,7 +601,7 @@ impl<'a> ArgMatches<'a> {
         // This would normally just be an empty string, which works on its
         // own, but if the patterns are joined in a set of alternations, then
         // you wind up with `foo|`, which is invalid.
-        self.word_pattern("z{0}".to_string())
+        self.word_pattern("(?:z{0})*".to_string())
     }
 
     /// Returns true if and only if file names containing each match should
@@ -552,7 +616,7 @@ impl<'a> ArgMatches<'a> {
             self.is_present("with-filename")
             || self.is_present("vimgrep")
             || paths.len() > 1
-            || paths.get(0).map_or(false, |p| p.is_dir())
+            || paths.get(0).map_or(false, |p| path_is_dir(p))
         }
     }
 
@@ -599,7 +663,7 @@ impl<'a> ArgMatches<'a> {
         } else {
             // If we're only searching a few paths and all of them are
             // files, then memory maps are probably faster.
-            paths.len() <= 10 && paths.iter().all(|p| p.is_file())
+            paths.len() <= 10 && paths.iter().all(|p| path_is_file(p))
         })
     }
 
@@ -636,7 +700,7 @@ impl<'a> ArgMatches<'a> {
 
     /// Returns the replacement string as UTF-8 bytes if it exists.
     fn replace(&self) -> Option<Vec<u8>> {
-        self.value_of_lossy("replace").map(|s| s.into_owned().into_bytes())
+        self.value_of_lossy("replace").map(|s| s.into_bytes())
     }
 
     /// Returns the unescaped context separator in UTF-8 bytes.
@@ -683,12 +747,34 @@ impl<'a> ArgMatches<'a> {
         })
     }
 
+    /// Returns whether the -c/--count or the --count-matches flags were
+    /// passed from the command line.
+    ///
+    /// If --count-matches and --invert-match were passed in, behave
+    /// as if --count and --invert-match were passed in (i.e. rg will
+    /// count inverted matches as per existing behavior).
+    fn counts(&self) -> (bool, bool) {
+        let count = self.is_present("count");
+        let count_matches = self.is_present("count-matches");
+        let invert_matches = self.is_present("invert-match");
+        let only_matching = self.is_present("only-matching");
+        if count_matches && invert_matches {
+            // Treat `-v --count-matches` as `-v -c`.
+            (true, false)
+        } else if count && only_matching {
+            // Treat `-c --only-matching` as `--count-matches`.
+            (false, true)
+        } else {
+            (count, count_matches)
+        }
+    }
+
     /// Returns the user's color choice based on command line parameters and
     /// environment.
     fn color_choice(&self) -> termcolor::ColorChoice {
-        let preference = match self.0.value_of_lossy("color") {
+        let preference = match self.value_of_lossy("color") {
             None => "auto".to_string(),
-            Some(v) => v.into_owned(),
+            Some(v) => v,
         };
         if preference == "always" {
             termcolor::ColorChoice::Always
@@ -734,7 +820,7 @@ impl<'a> ArgMatches<'a> {
     /// A `None` encoding implies that the encoding should be automatically
     /// detected on a per-file basis.
     fn encoding(&self) -> Result<Option<&'static Encoding>> {
-        match self.0.value_of_lossy("encoding") {
+        match self.value_of_lossy("encoding") {
             None => Ok(None),
             Some(label) => {
                 if label == "auto" {
@@ -747,6 +833,19 @@ impl<'a> ArgMatches<'a> {
                 }
             }
         }
+    }
+
+    /// Returns whether status should be tracked for this run of ripgrep
+
+    /// This is automatically disabled if we're asked to only list the
+    /// files that wil be searched, files with matches or files
+    /// without matches.
+    fn stats(&self) -> bool {
+        if self.is_present("files-with-matches") ||
+           self.is_present("files-without-match") {
+               return false;
+        }
+        self.is_present("stats")
     }
 
     /// Returns the approximate number of threads that ripgrep should use.
@@ -785,16 +884,7 @@ impl<'a> ArgMatches<'a> {
         if let Some(limit) = self.regex_size_limit()? {
             gb = gb.size_limit(limit);
         }
-        gb.build().map_err(|err| {
-            match err {
-                GrepError::Regex(err) => {
-                  let s = format!("{}\n(Hint: Try the --fixed-strings flag \
-                  to search for a literal string.)", err.to_string());
-                  From::from(s)
-                },
-                err => From::from(err)
-            }
-        })
+        Ok(gb.build()?)
     }
 
     /// Builds the set of glob overrides from the command line flags.
@@ -927,11 +1017,58 @@ impl<'a> ArgMatches<'a> {
 
     /// Safely reads an arg value with the given name, and if it's present,
     /// tries to parse it as a usize value.
+    ///
+    /// If the number is zero, then it is considered absent and `None` is
+    /// returned.
+    fn usize_of_nonzero(&self, name: &str) -> Result<Option<usize>> {
+        match self.value_of_lossy(name) {
+            None => Ok(None),
+            Some(v) => v.parse().map_err(From::from).map(|n| {
+                if n == 0 {
+                    None
+                } else {
+                    Some(n)
+                }
+            }),
+        }
+    }
+
+    /// Safely reads an arg value with the given name, and if it's present,
+    /// tries to parse it as a usize value.
     fn usize_of(&self, name: &str) -> Result<Option<usize>> {
         match self.value_of_lossy(name) {
             None => Ok(None),
             Some(v) => v.parse().map(Some).map_err(From::from),
         }
+    }
+
+    // The following methods mostly dispatch to the underlying clap methods
+    // directly. Methods that would otherwise get a single value will fetch
+    // all values and return the last one. (Clap returns the first one.) We
+    // only define the ones we need.
+
+    fn is_present(&self, name: &str) -> bool {
+        self.0.is_present(name)
+    }
+
+    fn occurrences_of(&self, name: &str) -> u64 {
+        self.0.occurrences_of(name)
+    }
+
+    fn value_of_lossy(&self, name: &str) -> Option<String> {
+        self.0.value_of_lossy(name).map(|s| s.into_owned())
+    }
+
+    fn values_of_lossy(&self, name: &str) -> Option<Vec<String>> {
+        self.0.values_of_lossy(name)
+    }
+
+    fn value_of_os(&'a self, name: &str) -> Option<&'a OsStr> {
+        self.0.value_of_os(name)
+    }
+
+    fn values_of_os(&'a self, name: &str) -> Option<clap::OsValues<'a>> {
+        self.0.values_of_os(name)
     }
 }
 
@@ -1025,4 +1162,45 @@ fn stdin_is_readable() -> bool {
     // On Windows, it's not clear what the possibilities are to me, so just
     // always return true.
     true
+}
+
+/// Returns true if and only if this path points to a directory.
+///
+/// This works around a bug in Rust's standard library:
+/// https://github.com/rust-lang/rust/issues/46484
+#[cfg(windows)]
+fn path_is_dir(path: &Path) -> bool {
+    fs::metadata(path).map(|md| metadata_is_dir(&md)).unwrap_or(false)
+}
+
+/// Returns true if and only if this entry points to a directory.
+#[cfg(not(windows))]
+fn path_is_dir(path: &Path) -> bool {
+    path.is_dir()
+}
+
+/// Returns true if and only if this path points to a file.
+///
+/// This works around a bug in Rust's standard library:
+/// https://github.com/rust-lang/rust/issues/46484
+#[cfg(windows)]
+fn path_is_file(path: &Path) -> bool {
+    !path_is_dir(path)
+}
+
+/// Returns true if and only if this entry points to a directory.
+#[cfg(not(windows))]
+fn path_is_file(path: &Path) -> bool {
+    path.is_file()
+}
+
+/// Returns true if and only if the given metadata points to a directory.
+///
+/// This works around a bug in Rust's standard library:
+/// https://github.com/rust-lang/rust/issues/46484
+#[cfg(windows)]
+fn metadata_is_dir(md: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    use winapi::um::winnt::FILE_ATTRIBUTE_DIRECTORY;
+    md.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0
 }

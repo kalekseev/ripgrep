@@ -3,11 +3,12 @@ extern crate bytecount;
 #[macro_use]
 extern crate clap;
 extern crate encoding_rs;
-extern crate env_logger;
+extern crate globset;
 extern crate grep;
 extern crate ignore;
 #[macro_use]
 extern crate lazy_static;
+extern crate libc;
 #[macro_use]
 extern crate log;
 extern crate memchr;
@@ -16,6 +17,8 @@ extern crate num_cpus;
 extern crate regex;
 extern crate same_file;
 extern crate termcolor;
+#[cfg(windows)]
+extern crate winapi;
 
 use std::error::Error;
 use std::process;
@@ -24,6 +27,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use args::Args;
 use worker::Work;
@@ -34,16 +38,12 @@ macro_rules! errored {
     }
 }
 
-macro_rules! eprintln {
-    ($($tt:tt)*) => {{
-        use std::io::Write;
-        let _ = writeln!(&mut ::std::io::stderr(), $($tt)*);
-    }}
-}
-
 mod app;
 mod args;
+mod config;
 mod decoder;
+mod decompressor;
+mod logger;
 mod pathutil;
 mod printer;
 mod search_buffer;
@@ -51,7 +51,7 @@ mod search_stream;
 mod unescape;
 mod worker;
 
-pub type Result<T> = result::Result<T, Box<Error + Send + Sync>>;
+pub type Result<T> = result::Result<T, Box<Error>>;
 
 fn main() {
     reset_sigpipe();
@@ -86,16 +86,19 @@ fn run(args: Arc<Args>) -> Result<u64> {
 }
 
 fn run_parallel(args: &Arc<Args>) -> Result<u64> {
+    let start_time = Instant::now();
     let bufwtr = Arc::new(args.buffer_writer());
     let quiet_matched = args.quiet_matched();
     let paths_searched = Arc::new(AtomicUsize::new(0));
-    let match_count = Arc::new(AtomicUsize::new(0));
+    let match_line_count = Arc::new(AtomicUsize::new(0));
+    let paths_matched = Arc::new(AtomicUsize::new(0));
 
     args.walker_parallel().run(|| {
         let args = Arc::clone(args);
         let quiet_matched = quiet_matched.clone();
         let paths_searched = paths_searched.clone();
-        let match_count = match_count.clone();
+        let match_line_count = match_line_count.clone();
+        let paths_matched = paths_matched.clone();
         let bufwtr = Arc::clone(&bufwtr);
         let mut buf = bufwtr.buffer();
         let mut worker = args.worker();
@@ -126,9 +129,12 @@ fn run_parallel(args: &Arc<Args>) -> Result<u64> {
                     } else {
                         worker.run(&mut printer, Work::DirEntry(dent))
                     };
-                match_count.fetch_add(count as usize, Ordering::SeqCst);
+                match_line_count.fetch_add(count as usize, Ordering::SeqCst);
                 if quiet_matched.set_match(count > 0) {
                     return Quit;
+                }
+                if args.stats() && count > 0 {
+                    paths_matched.fetch_add(1, Ordering::SeqCst);
                 }
             }
             // BUG(burntsushi): We should handle this error instead of ignoring
@@ -142,15 +148,28 @@ fn run_parallel(args: &Arc<Args>) -> Result<u64> {
             eprint_nothing_searched();
         }
     }
-    Ok(match_count.load(Ordering::SeqCst) as u64)
+    let match_line_count = match_line_count.load(Ordering::SeqCst) as u64;
+    let paths_searched = paths_searched.load(Ordering::SeqCst) as u64;
+    let paths_matched = paths_matched.load(Ordering::SeqCst) as u64;
+    if args.stats() {
+        print_stats(
+            match_line_count,
+            paths_searched,
+            paths_matched,
+            start_time.elapsed(),
+        );
+    }
+    Ok(match_line_count)
 }
 
 fn run_one_thread(args: &Arc<Args>) -> Result<u64> {
+    let start_time = Instant::now();
     let stdout = args.stdout();
     let mut stdout = stdout.lock();
     let mut worker = args.worker();
     let mut paths_searched: u64 = 0;
-    let mut match_count = 0;
+    let mut match_line_count = 0;
+    let mut paths_matched: u64 = 0;
     for result in args.walker() {
         let dent = match get_or_log_dir_entry(
             result,
@@ -162,7 +181,7 @@ fn run_one_thread(args: &Arc<Args>) -> Result<u64> {
             Some(dent) => dent,
         };
         let mut printer = args.printer(&mut stdout);
-        if match_count > 0 {
+        if match_line_count > 0 {
             if args.quiet() {
                 break;
             }
@@ -171,19 +190,31 @@ fn run_one_thread(args: &Arc<Args>) -> Result<u64> {
             }
         }
         paths_searched += 1;
-        match_count +=
+        let count =
             if dent.is_stdin() {
                 worker.run(&mut printer, Work::Stdin)
             } else {
                 worker.run(&mut printer, Work::DirEntry(dent))
             };
+        match_line_count += count;
+        if args.stats() && count > 0 {
+            paths_matched += 1;
+        }
     }
     if !args.paths().is_empty() && paths_searched == 0 {
         if !args.no_messages() {
             eprint_nothing_searched();
         }
     }
-    Ok(match_count)
+    if args.stats() {
+        print_stats(
+            match_line_count,
+            paths_searched,
+            paths_matched,
+            start_time.elapsed(),
+        );
+    }
+    Ok(match_line_count)
 }
 
 fn run_files_parallel(args: Arc<Args>) -> Result<u64> {
@@ -271,15 +302,14 @@ fn get_or_log_dir_entry(
                     eprintln!("{}", err);
                 }
             }
-            let ft = match dent.file_type() {
-                None => return Some(dent), // entry is stdin
-                Some(ft) => ft,
-            };
+            if dent.file_type().is_none() {
+                return Some(dent); // entry is stdin
+            }
             // A depth of 0 means the user gave the path explicitly, so we
             // should always try to search it.
-            if dent.depth() == 0 && !ft.is_dir() {
+            if dent.depth() == 0 && !ignore_entry_is_dir(&dent) {
                 return Some(dent);
-            } else if !ft.is_file() {
+            } else if !ignore_entry_is_file(&dent) {
                 return None;
             }
             // If we are redirecting stdout to a file, then don't search that
@@ -290,6 +320,45 @@ fn get_or_log_dir_entry(
             Some(dent)
         }
     }
+}
+
+/// Returns true if and only if the given `ignore::DirEntry` points to a
+/// directory.
+///
+/// This works around a bug in Rust's standard library:
+/// https://github.com/rust-lang/rust/issues/46484
+#[cfg(windows)]
+fn ignore_entry_is_dir(dent: &ignore::DirEntry) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    use winapi::um::winnt::FILE_ATTRIBUTE_DIRECTORY;
+
+    dent.metadata().map(|md| {
+        md.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0
+    }).unwrap_or(false)
+}
+
+/// Returns true if and only if the given `ignore::DirEntry` points to a
+/// directory.
+#[cfg(not(windows))]
+fn ignore_entry_is_dir(dent: &ignore::DirEntry) -> bool {
+    dent.file_type().map_or(false, |ft| ft.is_dir())
+}
+
+/// Returns true if and only if the given `ignore::DirEntry` points to a
+/// file.
+///
+/// This works around a bug in Rust's standard library:
+/// https://github.com/rust-lang/rust/issues/46484
+#[cfg(windows)]
+fn ignore_entry_is_file(dent: &ignore::DirEntry) -> bool {
+    !ignore_entry_is_dir(dent)
+}
+
+/// Returns true if and only if the given `ignore::DirEntry` points to a
+/// file.
+#[cfg(not(windows))]
+fn ignore_entry_is_file(dent: &ignore::DirEntry) -> bool {
+    dent.file_type().map_or(false, |ft| ft.is_file())
 }
 
 fn is_stdout_file(
@@ -336,6 +405,22 @@ fn eprint_nothing_searched() {
                Try running again with --debug.");
 }
 
+fn print_stats(
+    match_count: u64,
+    paths_searched: u64,
+    paths_matched: u64,
+    time_elapsed: Duration,
+) {
+    let time_elapsed =
+        time_elapsed.as_secs() as f64
+        + (time_elapsed.subsec_nanos() as f64 * 1e-9);
+    println!("\n{} matched lines\n\
+              {} files contained matches\n\
+              {} files searched\n\
+              {:.3} seconds", match_count, paths_matched,
+             paths_searched, time_elapsed);
+}
+
 // The Rust standard library suppresses the default SIGPIPE behavior, so that
 // writing to a closed pipe doesn't kill the process. The goal is to instead
 // handle errors through the normal result mechanism. Ripgrep needs some
@@ -344,7 +429,6 @@ fn eprint_nothing_searched() {
 // https://github.com/BurntSushi/ripgrep/issues/200.
 #[cfg(unix)]
 fn reset_sigpipe() {
-    extern crate libc;
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }

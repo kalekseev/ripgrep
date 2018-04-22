@@ -9,6 +9,7 @@ use memmap::Mmap;
 use termcolor::WriteColor;
 
 use decoder::DecodeReader;
+use decompressor::{self, DecompressionReader};
 use pathutil::strip_prefix;
 use printer::Printer;
 use search_buffer::BufferSearcher;
@@ -32,7 +33,9 @@ struct Options {
     encoding: Option<&'static Encoding>,
     after_context: usize,
     before_context: usize,
+    byte_offset: bool,
     count: bool,
+    count_matches: bool,
     files_with_matches: bool,
     files_without_matches: bool,
     eol: u8,
@@ -42,6 +45,7 @@ struct Options {
     no_messages: bool,
     quiet: bool,
     text: bool,
+    search_zip_files: bool
 }
 
 impl Default for Options {
@@ -51,7 +55,9 @@ impl Default for Options {
             encoding: None,
             after_context: 0,
             before_context: 0,
+            byte_offset: false,
             count: false,
+            count_matches: false,
             files_with_matches: false,
             files_without_matches: false,
             eol: b'\n',
@@ -61,6 +67,7 @@ impl Default for Options {
             no_messages: false,
             quiet: false,
             text: false,
+            search_zip_files: false,
         }
     }
 }
@@ -103,11 +110,30 @@ impl WorkerBuilder {
         self
     }
 
+    /// If enabled, searching will print a 0-based offset of the
+    /// matching line (or the actual match if -o is specified) before
+    /// printing the line itself.
+    ///
+    /// Disabled by default.
+    pub fn byte_offset(mut self, yes: bool) -> Self {
+        self.opts.byte_offset = yes;
+        self
+    }
+
     /// If enabled, searching will print a count instead of each match.
     ///
     /// Disabled by default.
     pub fn count(mut self, yes: bool) -> Self {
         self.opts.count = yes;
+        self
+    }
+
+    /// If enabled, searching will print the count of individual matches
+    /// instead of each match.
+    ///
+    /// Disabled by default.
+    pub fn count_matches(mut self, yes: bool) -> Self {
+        self.opts.count_matches = yes;
         self
     }
 
@@ -190,6 +216,12 @@ impl WorkerBuilder {
         self.opts.text = yes;
         self
     }
+
+    /// If enabled, search through compressed files as well
+    pub fn search_zip_files(mut self, yes: bool) -> Self {
+        self.opts.search_zip_files = yes;
+        self
+    }
 }
 
 /// Worker is responsible for executing searches on file paths, while choosing
@@ -218,22 +250,33 @@ impl Worker {
             }
             Work::DirEntry(dent) => {
                 let mut path = dent.path();
-                let file = match File::open(path) {
-                    Ok(file) => file,
-                    Err(err) => {
-                        if !self.opts.no_messages {
-                            eprintln!("{}: {}", path.display(), err);
+                if self.opts.search_zip_files
+                     && decompressor::is_compressed(path)
+                {
+                    match DecompressionReader::from_path(path) {
+                        Some(reader) => self.search(printer, path, reader),
+                        None => {
+                            return 0;
                         }
-                        return 0;
                     }
-                };
-                if let Some(p) = strip_prefix("./", path) {
-                    path = p;
-                }
-                if self.opts.mmap {
-                    self.search_mmap(printer, path, &file)
                 } else {
-                    self.search(printer, path, file)
+                    let file = match File::open(path) {
+                        Ok(file) => file,
+                        Err(err) => {
+                            if !self.opts.no_messages {
+                                eprintln!("{}: {}", path.display(), err);
+                            }
+                            return 0;
+                        }
+                    };
+                    if let Some(p) = strip_prefix("./", path) {
+                        path = p;
+                    }
+                    if self.opts.mmap {
+                        self.search_mmap(printer, path, &file)
+                    } else {
+                        self.search(printer, path, file)
+                    }
                 }
             }
         };
@@ -263,7 +306,9 @@ impl Worker {
         searcher
             .after_context(self.opts.after_context)
             .before_context(self.opts.before_context)
+            .byte_offset(self.opts.byte_offset)
             .count(self.opts.count)
+            .count_matches(self.opts.count_matches)
             .files_with_matches(self.opts.files_with_matches)
             .files_without_matches(self.opts.files_without_matches)
             .eol(self.opts.eol)
@@ -290,7 +335,10 @@ impl Worker {
             // regular read calls.
             return self.search(printer, path, file);
         }
-        let mmap = unsafe { Mmap::map(file)? };
+        let mmap = match self.mmap(file)? {
+            None => return self.search(printer, path, file),
+            Some(mmap) => mmap,
+        };
         let buf = &*mmap;
         if buf.len() >= 3 && Encoding::for_bom(buf).is_some() {
             // If we have a UTF-16 bom in our memory map, then we need to fall
@@ -299,7 +347,9 @@ impl Worker {
         }
         let searcher = BufferSearcher::new(printer, &self.grep, path, buf);
         Ok(searcher
+            .byte_offset(self.opts.byte_offset)
             .count(self.opts.count)
+            .count_matches(self.opts.count_matches)
             .files_with_matches(self.opts.files_with_matches)
             .files_without_matches(self.opts.files_without_matches)
             .eol(self.opts.eol)
@@ -310,4 +360,31 @@ impl Worker {
             .text(self.opts.text)
             .run())
     }
+
+    #[cfg(not(unix))]
+    fn mmap(&self, file: &File) -> Result<Option<Mmap>> {
+        Ok(Some(mmap_readonly(file)?))
+    }
+
+    #[cfg(unix)]
+    fn mmap(&self, file: &File) -> Result<Option<Mmap>> {
+        use libc::{EOVERFLOW, ENODEV, ENOMEM};
+
+        let err = match mmap_readonly(file) {
+            Ok(mmap) => return Ok(Some(mmap)),
+            Err(err) => err,
+        };
+        let code = err.raw_os_error();
+        if code == Some(EOVERFLOW)
+            || code == Some(ENODEV)
+            || code == Some(ENOMEM)
+        {
+            return Ok(None);
+        }
+        Err(From::from(err))
+    }
+}
+
+fn mmap_readonly(file: &File) -> io::Result<Mmap> {
+    unsafe { Mmap::map(file) }
 }
