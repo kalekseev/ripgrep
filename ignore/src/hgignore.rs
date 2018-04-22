@@ -18,26 +18,26 @@ use {Error, Match, PartialErrorBuilder};
 use pathutil::{is_file_name, strip_prefix};
 
 
-/// doc
+/// Pattern represents a rule from hgignore file (regex or glob).
 #[derive(Clone, Debug)]
 pub enum Pattern {
-    /// doc
+    /// Glob represents a single glob in a hgignore file.
     Glob {
-        /// doc
+        /// The file path that this glob was extracted from.
         from: Option<PathBuf>,
-        /// doc
+        /// The original glob string.
         original: String,
-        /// doc
+        /// The actual glob string used to convert to a regex.
         actual: String,
-        /// doc
-        is_only_dir: bool
+        /// Whether this glob should only match directories or not.
+        is_only_dir: bool,
     },
-    /// doc
+    /// Regex represents a single regex in a hgignore file.
     Regex {
-        /// doc
+        /// The file path that this glob was extracted from.
         from: Option<PathBuf>,
-        /// doc
-        original: String,
+        /// The regex string from hginore file.
+        regex: String,
     }
 }
 
@@ -54,7 +54,7 @@ impl Pattern {
     pub fn original(&self) -> &str {
         match self {
             &Pattern::Glob { ref original, .. } => &original,
-            &Pattern::Regex { ref original, .. } => &original,
+            &Pattern::Regex { ref regex, .. } => &regex,
         }
     }
 
@@ -63,7 +63,7 @@ impl Pattern {
     pub fn actual(&self) -> &str {
         match self {
             &Pattern::Glob { ref actual, .. } => &actual,
-            &Pattern::Regex { ref original, .. } => &original,
+            &Pattern::Regex { ref regex, .. } => &regex,
         }
     }
 
@@ -313,6 +313,26 @@ impl HgignoreBuilder {
         errs.into_error_option()
     }
 
+    /// Add each glob line from the string given.
+    ///
+    /// If this string came from a particular `hgignore` file, then its path
+    /// should be provided here.
+    ///
+    /// The string given should be formatted as a `hgignore` file
+    /// without syntax switch in it.
+    #[cfg(test)]
+    fn add_str(
+        &mut self,
+        from: Option<PathBuf>,
+        hgignore: &str,
+        current_syntax: HgignoreSyntax
+    ) -> Result<&mut HgignoreBuilder, Error> {
+        for line in hgignore.lines() {
+            self.add_line(from.clone(), line, current_syntax)?;
+        }
+        Ok(self)
+    }
+
     /// doc
     pub fn add_line(
         &mut self,
@@ -329,15 +349,19 @@ impl HgignoreBuilder {
         }
         // TODO: extended patterns support, see hg help patterns
         lazy_static! {
-            static ref EXT_PATTERN: Regex = Regex::new(r"^(\w+):").unwrap();
+            static ref EXT_PATTERN: Regex = Regex::new(r"^(\w+):(.*)$").unwrap();
         };
         match EXT_PATTERN.captures(line.as_bytes()) {
             Some(caps) => {
                 match &caps[1] {
                     b"path" => debug!("HG pattern \"path:\" is not supported."),
                     b"rootfilesin" => debug!("HG pattern \"rootfilesin:\" is not supported."),
-                    b"glob" => debug!("HG pattern \"glob:\" is not supported."),
-                    b"re" => debug!("HG pattern \"re:\" is not supported."),
+                    b"glob" => {
+                        return self.add_glob_line(from, str::from_utf8(&caps[2]).unwrap())
+                    }
+                    b"re" => {
+                        return self.add_regex_line(from, str::from_utf8(&caps[2]).unwrap())
+                    }
                     b"listfile" => debug!("HG pattern \"listfile:\" is not supported."),
                     b"listfile0" => debug!("HG pattern \"listfile0:\" is not supported."),
                     b"include" => debug!("HG pattern \"include:\" is not supported."),
@@ -372,7 +396,7 @@ impl HgignoreBuilder {
         // Another option is to use list of regexes instead of RegexSet
         self.regex_lines.push(Pattern::Regex {
             from: from,
-            original: line.to_string(),
+            regex: line.to_string(),
         });
         Ok(self)
     }
@@ -389,21 +413,8 @@ impl HgignoreBuilder {
 
         let mut literal_separator = false;
         let has_slash = line.chars().any(|c| c == '/');
-        let mut is_absolute = false;
         if line.starts_with("\\#") {
             line = &line[1..];
-            is_absolute = line.chars().nth(0) == Some('/');
-        } else {
-            // FIXME: this is not the case for hgignore
-            if line.starts_with("/") {
-                // `man gitignore` says that if a glob starts with a slash,
-                // then the glob can only match the beginning of a path
-                // (relative to the location of gitignore). We achieve this by
-                // simply banning wildcards from matching /.
-                literal_separator = true;
-                line = &line[1..];
-                is_absolute = true;
-            }
         }
         // If it ends with a slash, then this should only match directories,
         // but the slash should otherwise not be used while globbing.
@@ -422,11 +433,8 @@ impl HgignoreBuilder {
         // If there was a leading slash, then this is a glob that must
         // match the entire path name. Otherwise, we should let it match
         // anywhere, so use a **/ prefix.
-        if !is_absolute {
-            // ... but only if we don't already have a **/ prefix.
-            if !actual.starts_with("**/") {
-                actual = format!("**/{}", actual);
-            }
+        if !(actual.starts_with("**/") || (actual == "**" && is_only_dir)) {
+            actual = format!("**/{}", actual);
         }
         // If the glob ends with `/**`, then we should only match everything
         // inside a directory, but not the directory itself. Standard globs
@@ -510,4 +518,120 @@ fn expand_tilde(path: &str) -> String {
         None
     };
     expanded_path.unwrap_or(path.to_string())
+}
+
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use super::{Hgignore, HgignoreBuilder, HgignoreSyntax};
+
+    fn hgi_from_str<P: AsRef<Path>>(root: P, s: &str, current_syntax: HgignoreSyntax) -> Hgignore {
+        let mut builder = HgignoreBuilder::new(root);
+        builder.add_str(None, s, current_syntax).unwrap();
+        builder.build().unwrap()
+    }
+
+    macro_rules! ignored_glob {
+        ($name:ident, $root:expr, $hgi:expr, $path:expr) => {
+            ignored_glob!($name, $root, $hgi, $path, false);
+        };
+        ($name:ident, $root:expr, $hgi:expr, $path:expr, $is_dir:expr) => {
+            #[test]
+            fn $name() {
+                let hgi = hgi_from_str($root, $hgi, HgignoreSyntax::Glob);
+                assert!(hgi.matched($path, $is_dir).is_ignore());
+            }
+        };
+    }
+
+    macro_rules! ignored_re {
+        ($name:ident, $root:expr, $hgi:expr, $path:expr) => {
+            ignored_re!($name, $root, $hgi, $path, false);
+        };
+        ($name:ident, $root:expr, $hgi:expr, $path:expr, $is_dir:expr) => {
+            #[test]
+            fn $name() {
+                let hgi = hgi_from_str($root, $hgi, HgignoreSyntax::Regexp);
+                assert!(hgi.matched($path, $is_dir).is_ignore());
+            }
+        };
+    }
+
+    macro_rules! not_ignored_glob {
+        ($name:ident, $root:expr, $hgi:expr, $path:expr) => {
+            not_ignored_glob!($name, $root, $hgi, $path, false);
+        };
+        ($name:ident, $root:expr, $hgi:expr, $path:expr, $is_dir:expr) => {
+            #[test]
+            fn $name() {
+                let hgi = hgi_from_str($root, $hgi, HgignoreSyntax::Glob);
+                assert!(!hgi.matched($path, $is_dir).is_ignore());
+            }
+        };
+    }
+
+    const ROOT: &'static str = "/home/foobar/rust/rg";
+
+    ignored_glob!(ig1, ROOT, "months", "months");
+    ignored_glob!(ig2, ROOT, "*.lock", "Cargo.lock");
+    ignored_glob!(ig3, ROOT, "*.rs", "src/main.rs");
+    ignored_glob!(ig4, ROOT, "src/*.rs", "src/main.rs");
+    ignored_glob!(ig8, ROOT, "foo/", "foo", true);
+    ignored_glob!(ig9, ROOT, "**/foo", "foo");
+    ignored_glob!(ig10, ROOT, "**/foo", "src/foo");
+    ignored_glob!(ig11, ROOT, "**/foo/**", "src/foo/bar");
+    ignored_glob!(ig12, ROOT, "**/foo/**", "wat/src/foo/bar/baz");
+    ignored_glob!(ig13, ROOT, "**/foo/bar", "foo/bar");
+    ignored_glob!(ig14, ROOT, "**/foo/bar", "src/foo/bar");
+    ignored_glob!(ig15, ROOT, "abc/**", "abc/x");
+    ignored_glob!(ig16, ROOT, "abc/**", "abc/x/y");
+    ignored_glob!(ig17, ROOT, "abc/**", "abc/x/y/z");
+    ignored_glob!(ig18, ROOT, "a/**/b", "a/b");
+    ignored_glob!(ig19, ROOT, "a/**/b", "a/x/b");
+    ignored_glob!(ig20, ROOT, "a/**/b", "a/x/y/b");
+    ignored_glob!(ig21, ROOT, "!xy", "!xy");
+    ignored_glob!(ig22, ROOT, r"\#foo", "#foo");
+    ignored_glob!(ig23, ROOT, "foo", "./foo");
+    ignored_glob!(ig24, ROOT, "target", "grep/target");
+    ignored_glob!(ig25, ROOT, "Cargo.lock", "./tabwriter-bin/Cargo.lock");
+    ignored_glob!(ig27, ROOT, "foo/", "xyz/foo", true);
+    ignored_glob!(ig29, ROOT, "node_modules/ ", "node_modules", true);
+    ignored_glob!(ig30, ROOT, "**/", "foo/bar", true);
+    ignored_glob!(ig31, ROOT, "path1/*", "path1/foo");
+    ignored_glob!(ig32, ROOT, ".a/b", ".a/b");
+    ignored_glob!(ig33, "./", ".a/b", ".a/b");
+    // ignored_glob!(ig34, ".", ".a/b", ".a/b");
+    // ignored_glob!(ig35, "./.", ".a/b", ".a/b");
+    ignored_glob!(ig36, "././", ".a/b", ".a/b");
+    ignored_glob!(ig37, "././.", ".a/b", ".a/b");
+    ignored_glob!(ig38, ROOT, "\\[", "[");
+    ignored_glob!(ig39, ROOT, "\\?", "?");
+    ignored_glob!(ig40, ROOT, "\\*", "*");
+    ignored_glob!(ig41, ROOT, "\\a", "a");
+    // ignored_glob!(ig42, ROOT, "foo  # comment", "foo");
+
+    ignored_re!(ig5, ROOT, r"^.*\.c", "cat-file.c");
+    ignored_re!(ig6, ROOT, r"^src/.*\.rs", "src/main.rs");
+    ignored_re!(ig26, ROOT, "^foo/bar/baz", "./foo/bar/baz");
+    ignored_re!(ig28, "./src", "^llvm/", "./src/llvm/", true);
+    ignored_re!(ig43, ROOT, "months", "months");
+    ignored_re!(ig44, ROOT, r".*\.lock$", "Cargo.lock");
+    ignored_re!(ig45, ROOT, r".*\.rs$", "src/main.rs");
+    ignored_re!(ig46, ROOT, r"^src/.*\.rs$", "src/main.rs");
+
+    not_ignored_glob!(ignot1, ROOT, "amonths", "months");
+    not_ignored_glob!(ignot2, ROOT, "monthsa", "months");
+    not_ignored_glob!(ignot7, ROOT, "foo/", "foo", false);
+    not_ignored_glob!(ignot8, ROOT, "**/foo/**", "wat/src/afoo/bar/baz");
+    not_ignored_glob!(ignot9, ROOT, "**/foo/**", "wat/src/fooa/bar/baz");
+    not_ignored_glob!(ignot10, ROOT, "**/foo/bar", "foo/src/bar");
+    not_ignored_glob!(ignot11, ROOT, "#foo", "#foo");
+    not_ignored_glob!(ignot12, ROOT, "\n\n\n", "foo");
+    not_ignored_glob!(ignot13, ROOT, "foo/**", "foo", true);
+    not_ignored_glob!(
+        ignot14, "./third_party/protobuf", "m4/ltoptions.m4",
+        "./third_party/protobuf/csharp/src/packages/repositories.config");
+    // not_ignored_glob!(ignot17, ROOT, "src/*.rs", "src/grep/src/main.rs");
+    // not_ignored_glob!(ignot18, ROOT, "path1/*", "path2/path1/foo");
 }
