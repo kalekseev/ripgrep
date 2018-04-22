@@ -4,19 +4,18 @@ doc
 use std::cell::RefCell;
 use std::env;
 use std::fs::File;
-use std::io::{self, Read, BufRead};
-use std::path::{PathBuf};
+use std::io::{self, BufRead, Read};
+use std::path::Path;
+use std::path::PathBuf;
 use std::str;
 use std::sync::Arc;
-use std::path::Path;
 
-use globset::{Candidate, GlobSetBuilder, GlobSet, GlobBuilder};
+use globset::{Candidate, GlobBuilder, GlobSet, GlobSetBuilder};
 use regex::bytes::{Regex, RegexSet};
 use thread_local::ThreadLocal;
 
-use {Error, Match, PartialErrorBuilder};
 use pathutil::{is_file_name, strip_prefix};
-
+use {Error, Match, PartialErrorBuilder};
 
 /// Pattern represents a rule from hgignore file (regex or glob).
 #[derive(Clone, Debug)]
@@ -38,7 +37,7 @@ pub enum Pattern {
         from: Option<PathBuf>,
         /// The regex string from hginore file.
         regex: String,
-    }
+    },
 }
 
 impl Pattern {
@@ -76,7 +75,6 @@ impl Pattern {
     }
 }
 
-
 /// doc
 #[derive(Clone, Debug)]
 pub struct Hgignore {
@@ -91,9 +89,7 @@ pub struct Hgignore {
 
 impl Hgignore {
     /// doc
-    pub fn new<P: AsRef<Path>>(
-        hgignore_path: P,
-    ) -> (Hgignore, Option<Error>) {
+    pub fn new<P: AsRef<Path>>(hgignore_path: P) -> (Hgignore, Option<Error>) {
         let path = hgignore_path.as_ref();
         let parent = path.parent().unwrap_or(Path::new("/"));
         let mut builder = HgignoreBuilder::new(parent);
@@ -144,11 +140,7 @@ impl Hgignore {
     /// determined by a common suffix of the directory containing this
     /// hgignore) is stripped. If there is no common suffix/prefix overlap,
     /// then `path` is assumed to be relative to this matcher.
-    pub fn matched<P: AsRef<Path>>(
-        &self,
-        path: P,
-        is_dir: bool,
-    ) -> Match<&Pattern> {
+    pub fn matched<P: AsRef<Path>>(&self, path: P, is_dir: bool) -> Match<&Pattern> {
         if self.is_empty() {
             return Match::None;
         }
@@ -156,11 +148,7 @@ impl Hgignore {
     }
 
     /// Like matched, but takes a path that has already been stripped.
-    fn matched_stripped<P: AsRef<Path>>(
-        &self,
-        path: P,
-        is_dir: bool,
-    ) -> Match<&Pattern> {
+    fn matched_stripped<P: AsRef<Path>>(&self, path: P, is_dir: bool) -> Match<&Pattern> {
         if !self.set.is_empty() {
             let path = path.as_ref();
             let candidate = Candidate::new(path);
@@ -170,7 +158,7 @@ impl Hgignore {
             for &i in matches.iter().rev() {
                 let glob = &self.globs[i];
                 if !glob.is_only_dir() || is_dir {
-                    return Match::Ignore(glob)
+                    return Match::Ignore(glob);
                 }
             }
         }
@@ -188,10 +176,7 @@ impl Hgignore {
 
     /// Strips the given path such that it's suitable for matching with this
     /// hgignore matcher.
-    fn strip<'a, P: 'a + AsRef<Path> + ?Sized>(
-        &'a self,
-        path: &'a P,
-    ) -> &'a Path {
+    fn strip<'a, P: 'a + AsRef<Path> + ?Sized>(&'a self, path: &'a P) -> &'a Path {
         let mut path = path.as_ref();
         // A leading ./ is completely superfluous. We also strip it from
         // our hgignore root path, so we need to strip it from our candidate
@@ -248,17 +233,11 @@ impl HgignoreBuilder {
 
     /// doc
     pub fn build(&self) -> Result<Hgignore, Error> {
-        let set = try!(
-            self.builder.build().map_err(|err| {
-                Error::Glob {
-                    glob: None,
-                    err: err.to_string(),
-                }
-            }));
-        let rls: Vec<&str> = self.regex_lines
-            .iter()
-            .map(|ref x| x.original())
-            .collect();
+        let set = try!(self.builder.build().map_err(|err| Error::Glob {
+            glob: None,
+            err: err.to_string(),
+        }));
+        let rls: Vec<&str> = self.regex_lines.iter().map(|ref x| x.original()).collect();
         let nignore = self.globs.iter().count() + rls.iter().count();
         return Ok(Hgignore {
             set: set,
@@ -274,8 +253,7 @@ impl HgignoreBuilder {
     /// doc
     pub fn add<P: AsRef<Path>>(&mut self, path: P) -> Option<Error> {
         lazy_static! {
-            static ref SYNTAX_SWITCH: Regex = Regex::new(
-                r"^syntax:\s*(regexp|glob)\s*$").unwrap();
+            static ref SYNTAX_SWITCH: Regex = Regex::new(r"^syntax:\s*(regexp|glob)\s*$").unwrap();
         };
         let mut current_syntax = HgignoreSyntax::Regexp;
         let path = path.as_ref();
@@ -296,18 +274,17 @@ impl HgignoreBuilder {
             };
             match SYNTAX_SWITCH.captures(line.as_bytes()) {
                 None => {
-                    if let Err(err) = self.add_line(
-                        Some(path.to_path_buf()), &line, current_syntax
-                    ) {
+                    if let Err(err) = self.add_line(Some(path.to_path_buf()), &line, current_syntax)
+                    {
                         errs.push(err.tagged(path, lineno));
                     };
-                },
+                }
                 Some(caps) => {
                     current_syntax = match &caps[1] {
                         b"glob" => HgignoreSyntax::Glob,
                         _ => HgignoreSyntax::Regexp,
                     }
-                },
+                }
             };
         }
         errs.into_error_option()
@@ -325,7 +302,7 @@ impl HgignoreBuilder {
         &mut self,
         from: Option<PathBuf>,
         hgignore: &str,
-        current_syntax: HgignoreSyntax
+        current_syntax: HgignoreSyntax,
     ) -> Result<&mut HgignoreBuilder, Error> {
         for line in hgignore.lines() {
             self.add_line(from.clone(), line, current_syntax)?;
@@ -338,7 +315,7 @@ impl HgignoreBuilder {
         &mut self,
         from: Option<PathBuf>,
         mut line: &str,
-        current_syntax: HgignoreSyntax
+        current_syntax: HgignoreSyntax,
     ) -> Result<&mut HgignoreBuilder, Error> {
         if line.starts_with("#") {
             return Ok(self);
@@ -356,12 +333,8 @@ impl HgignoreBuilder {
                 match &caps[1] {
                     b"path" => debug!("HG pattern \"path:\" is not supported."),
                     b"rootfilesin" => debug!("HG pattern \"rootfilesin:\" is not supported."),
-                    b"glob" => {
-                        return self.add_glob_line(from, str::from_utf8(&caps[2]).unwrap())
-                    }
-                    b"re" => {
-                        return self.add_regex_line(from, str::from_utf8(&caps[2]).unwrap())
-                    }
+                    b"glob" => return self.add_glob_line(from, str::from_utf8(&caps[2]).unwrap()),
+                    b"re" => return self.add_regex_line(from, str::from_utf8(&caps[2]).unwrap()),
                     b"listfile" => debug!("HG pattern \"listfile:\" is not supported."),
                     b"listfile0" => debug!("HG pattern \"listfile0:\" is not supported."),
                     b"include" => debug!("HG pattern \"include:\" is not supported."),
@@ -371,15 +344,13 @@ impl HgignoreBuilder {
                             HgignoreSyntax::Glob => self.add_glob_line(from, line),
                             HgignoreSyntax::Regexp => self.add_regex_line(from, line),
                         }
-                    },
+                    }
                 }
                 return Ok(self);
-            },
-            None => {
-                match current_syntax {
-                    HgignoreSyntax::Glob => self.add_glob_line(from, line),
-                    HgignoreSyntax::Regexp => self.add_regex_line(from, line),
-                }
+            }
+            None => match current_syntax {
+                HgignoreSyntax::Glob => self.add_glob_line(from, line),
+                HgignoreSyntax::Regexp => self.add_regex_line(from, line),
             },
         }
     }
@@ -446,12 +417,11 @@ impl HgignoreBuilder {
             GlobBuilder::new(&actual)
                 .literal_separator(literal_separator)
                 .build()
-                .map_err(|err| {
-                    Error::Glob {
-                        glob: Some(original.clone()),
-                        err: err.kind().to_string(),
-                    }
-                }));
+                .map_err(|err| Error::Glob {
+                    glob: Some(original.clone()),
+                    err: err.kind().to_string(),
+                })
+        );
         self.builder.add(parsed);
         self.globs.push(Pattern::Glob {
             from: from,
@@ -460,13 +430,11 @@ impl HgignoreBuilder {
             is_only_dir: is_only_dir,
         });
         Ok(self)
-
     }
 }
 
 fn hgrc_ignore_path() -> Option<PathBuf> {
-    hgrc_contents()
-        .and_then(|data| parse_ignore_file(&data))
+    hgrc_contents().and_then(|data| parse_ignore_file(&data))
 }
 
 /// Provides paths to per-user mercurial configs
@@ -499,14 +467,15 @@ fn hgrc_contents() -> Option<Vec<u8>> {
 // TODO: parse only [ui] section
 fn parse_ignore_file(data: &[u8]) -> Option<PathBuf> {
     lazy_static! {
-        static ref RE: Regex = Regex::new(
-            r"(?ium)^\s*ignore\s*=\s*(.+)\s*$").unwrap();
+        static ref RE: Regex = Regex::new(r"(?ium)^\s*ignore\s*=\s*(.+)\s*$").unwrap();
     };
     let caps = match RE.captures(data) {
         None => return None,
         Some(caps) => caps,
     };
-    str::from_utf8(&caps[1]).ok().map(|s| PathBuf::from(expand_tilde(s)))
+    str::from_utf8(&caps[1])
+        .ok()
+        .map(|s| PathBuf::from(expand_tilde(s)))
 }
 
 /// Expands `~/` in file paths to the value of $HOME.
@@ -520,11 +489,10 @@ fn expand_tilde(path: &str) -> String {
     expanded_path.unwrap_or(path.to_string())
 }
 
-
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
     use super::{Hgignore, HgignoreBuilder, HgignoreSyntax};
+    use std::path::Path;
 
     fn hgi_from_str<P: AsRef<Path>>(root: P, s: &str, current_syntax: HgignoreSyntax) -> Hgignore {
         let mut builder = HgignoreBuilder::new(root);
@@ -630,8 +598,11 @@ mod tests {
     not_ignored_glob!(ignot12, ROOT, "\n\n\n", "foo");
     not_ignored_glob!(ignot13, ROOT, "foo/**", "foo", true);
     not_ignored_glob!(
-        ignot14, "./third_party/protobuf", "m4/ltoptions.m4",
-        "./third_party/protobuf/csharp/src/packages/repositories.config");
+        ignot14,
+        "./third_party/protobuf",
+        "m4/ltoptions.m4",
+        "./third_party/protobuf/csharp/src/packages/repositories.config"
+    );
     // not_ignored_glob!(ignot17, ROOT, "src/*.rs", "src/grep/src/main.rs");
     // not_ignored_glob!(ignot18, ROOT, "path1/*", "path2/path1/foo");
 }
