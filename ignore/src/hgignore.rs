@@ -320,7 +320,7 @@ impl HgignoreBuilder {
         if line.starts_with("#") {
             return Ok(self);
         }
-        line = line.trim_right();
+        line = trim_comment(line).trim_right();
         if line.is_empty() {
             return Ok(self);
         }
@@ -365,10 +365,17 @@ impl HgignoreBuilder {
         // fail. So we have to create regexes twice:
         // during validation and during RegexSet build.
         // Another option is to use list of regexes instead of RegexSet
-        self.regex_lines.push(Pattern::Regex {
-            from: from,
-            regex: line.to_string(),
-        });
+        match Regex::new(line) {
+            Ok(_) => {
+                self.regex_lines.push(Pattern::Regex {
+                    from: from,
+                    regex: line.to_string(),
+                });
+            }
+            Err(_) => {
+                debug!("{} is not valid rust regex.", line);
+            }
+        };
         Ok(self)
     }
 
@@ -489,6 +496,19 @@ fn expand_tilde(path: &str) -> String {
     expanded_path.unwrap_or(path.to_string())
 }
 
+/// Remove part of line without cars after leftmost #.
+/// Mercurial consider sequence \# as escaped #.
+fn trim_comment(line: &str) -> &str {
+    let mut prev_char: char = ' ';
+    return line.split(|c| {
+        if c == '#' && prev_char != '\\' {
+            return true;
+        }
+        prev_char = c;
+        return false;
+    }).nth(0).unwrap();
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Hgignore, HgignoreBuilder, HgignoreSyntax};
@@ -539,54 +559,52 @@ mod tests {
         };
     }
 
+    macro_rules! not_ignored_re {
+        ($name:ident, $root:expr, $hgi:expr, $path:expr) => {
+            not_ignored_re!($name, $root, $hgi, $path, false);
+        };
+        ($name:ident, $root:expr, $hgi:expr, $path:expr, $is_dir:expr) => {
+            #[test]
+            fn $name() {
+                let hgi = hgi_from_str($root, $hgi, HgignoreSyntax::Regexp);
+                assert!(!hgi.matched($path, $is_dir).is_ignore());
+            }
+        };
+    }
+
     const ROOT: &'static str = "/home/foobar/rust/rg";
 
     ignored_glob!(ig1, ROOT, "months", "months");
     ignored_glob!(ig2, ROOT, "*.lock", "Cargo.lock");
     ignored_glob!(ig3, ROOT, "*.rs", "src/main.rs");
     ignored_glob!(ig4, ROOT, "src/*.rs", "src/main.rs");
-    ignored_glob!(ig8, ROOT, "foo/", "foo", true);
-    ignored_glob!(ig9, ROOT, "**/foo", "foo");
-    ignored_glob!(ig10, ROOT, "**/foo", "src/foo");
-    ignored_glob!(ig11, ROOT, "**/foo/**", "src/foo/bar");
-    ignored_glob!(ig12, ROOT, "**/foo/**", "wat/src/foo/bar/baz");
-    ignored_glob!(ig13, ROOT, "**/foo/bar", "foo/bar");
-    ignored_glob!(ig14, ROOT, "**/foo/bar", "src/foo/bar");
-    ignored_glob!(ig15, ROOT, "abc/**", "abc/x");
-    ignored_glob!(ig16, ROOT, "abc/**", "abc/x/y");
-    ignored_glob!(ig17, ROOT, "abc/**", "abc/x/y/z");
-    ignored_glob!(ig18, ROOT, "a/**/b", "a/b");
-    ignored_glob!(ig19, ROOT, "a/**/b", "a/x/b");
-    ignored_glob!(ig20, ROOT, "a/**/b", "a/x/y/b");
-    ignored_glob!(ig21, ROOT, "!xy", "!xy");
-    ignored_glob!(ig22, ROOT, r"\#foo", "#foo");
-    ignored_glob!(ig23, ROOT, "foo", "./foo");
-    ignored_glob!(ig24, ROOT, "target", "grep/target");
-    ignored_glob!(ig25, ROOT, "Cargo.lock", "./tabwriter-bin/Cargo.lock");
-    ignored_glob!(ig27, ROOT, "foo/", "xyz/foo", true);
-    ignored_glob!(ig29, ROOT, "node_modules/ ", "node_modules", true);
-    ignored_glob!(ig30, ROOT, "**/", "foo/bar", true);
-    ignored_glob!(ig31, ROOT, "path1/*", "path1/foo");
-    ignored_glob!(ig32, ROOT, ".a/b", ".a/b");
-    ignored_glob!(ig33, "./", ".a/b", ".a/b");
-    // ignored_glob!(ig34, ".", ".a/b", ".a/b");
-    // ignored_glob!(ig35, "./.", ".a/b", ".a/b");
-    ignored_glob!(ig36, "././", ".a/b", ".a/b");
-    ignored_glob!(ig37, "././.", ".a/b", ".a/b");
-    ignored_glob!(ig38, ROOT, "\\[", "[");
-    ignored_glob!(ig39, ROOT, "\\?", "?");
-    ignored_glob!(ig40, ROOT, "\\*", "*");
-    ignored_glob!(ig41, ROOT, "\\a", "a");
-    // ignored_glob!(ig42, ROOT, "foo  # comment", "foo");
-
-    ignored_re!(ig5, ROOT, r"^.*\.c", "cat-file.c");
-    ignored_re!(ig6, ROOT, r"^src/.*\.rs", "src/main.rs");
-    ignored_re!(ig26, ROOT, "^foo/bar/baz", "./foo/bar/baz");
-    ignored_re!(ig28, "./src", "^llvm/", "./src/llvm/", true);
-    ignored_re!(ig43, ROOT, "months", "months");
-    ignored_re!(ig44, ROOT, r".*\.lock$", "Cargo.lock");
-    ignored_re!(ig45, ROOT, r".*\.rs$", "src/main.rs");
-    ignored_re!(ig46, ROOT, r"^src/.*\.rs$", "src/main.rs");
+    ignored_glob!(ig5, ROOT, "foo/", "foo", true);
+    ignored_glob!(ig6, ROOT, "**/foo", "foo");
+    ignored_glob!(ig7, ROOT, "**/foo", "src/foo");
+    ignored_glob!(ig8, ROOT, "**/foo/**", "src/foo/bar");
+    ignored_glob!(ig9, ROOT, "**/foo/**", "wat/src/foo/bar/baz");
+    ignored_glob!(ig10, ROOT, "**/foo/bar", "foo/bar");
+    ignored_glob!(ig11, ROOT, "**/foo/bar", "src/foo/bar");
+    ignored_glob!(ig12, ROOT, "abc/**", "abc/x");
+    ignored_glob!(ig13, ROOT, "abc/**", "abc/x/y");
+    ignored_glob!(ig14, ROOT, "abc/**", "abc/x/y/z");
+    ignored_glob!(ig15, ROOT, "a/**/b", "a/b");
+    ignored_glob!(ig16, ROOT, "a/**/b", "a/x/b");
+    ignored_glob!(ig17, ROOT, "a/**/b", "a/x/y/b");
+    ignored_glob!(ig18, ROOT, "!xy", "!xy");
+    ignored_glob!(ig19, ROOT, r"\#foo", "#foo");
+    ignored_glob!(ig20, ROOT, "foo", "./foo");
+    ignored_glob!(ig21, ROOT, "target", "grep/target");
+    ignored_glob!(ig22, ROOT, "Cargo.lock", "./tabwriter-bin/Cargo.lock");
+    ignored_glob!(ig23, ROOT, "foo/", "xyz/foo", true);
+    ignored_glob!(ig24, ROOT, "node_modules/ ", "node_modules", true);
+    ignored_glob!(ig25, ROOT, "**/", "foo/bar", true);
+    ignored_glob!(ig26, ROOT, "path1/*", "path1/foo");
+    ignored_glob!(ig27, ROOT, "foo  # comment", "foo");
+    ignored_glob!(ig28, ROOT, r"foo  \#", "foo  #");
+    ignored_glob!(ig29, ROOT, r"foo  \#\##comment # and comment", "foo  ##");
+    ignored_glob!(ig30, ROOT, "path1/*", "path2/path1/foo");
+    ignored_glob!(ig31, ROOT, "src/*.rs", "src/grep/src/main.rs");
 
     not_ignored_glob!(ignot1, ROOT, "amonths", "months");
     not_ignored_glob!(ignot2, ROOT, "monthsa", "months");
@@ -603,6 +621,26 @@ mod tests {
         "m4/ltoptions.m4",
         "./third_party/protobuf/csharp/src/packages/repositories.config"
     );
-    // not_ignored_glob!(ignot17, ROOT, "src/*.rs", "src/grep/src/main.rs");
-    // not_ignored_glob!(ignot18, ROOT, "path1/*", "path2/path1/foo");
+
+    ignored_re!(ir1, ROOT, r"^.*\.c", "cat-file.c");
+    ignored_re!(ir2, ROOT, r"^src/.*\.rs", "src/main.rs");
+    ignored_re!(ir3, ROOT, "^foo/bar/baz", "./foo/bar/baz");
+    ignored_re!(ir4, "./src", "^llvm/", "./src/llvm/", true);
+    ignored_re!(ir5, ROOT, "months", "months");
+    ignored_re!(ir6, ROOT, r".*\.lock$", "Cargo.lock");
+    ignored_re!(ir7, ROOT, r".*\.rs$", "src/main.rs");
+    ignored_re!(ir8, ROOT, r"^src/.*\.rs$", "src/main.rs");
+    ignored_re!(ir9, ROOT, ".a/b", ".a/b");
+    ignored_re!(ir10, "./", ".a/b", ".a/b");
+    // ignored_re!(ir11, ".", ".a/b", ".a/b");
+    // ignored_re!(ir12, "./.", ".a/b", ".a/b");
+    ignored_re!(ir13, "././", ".a/b", ".a/b");
+    ignored_re!(ir14, "././.", ".a/b", ".a/b");
+    ignored_re!(ir15, ROOT, r"\[", "[");
+    ignored_re!(ir16, ROOT, r"\?", "?");
+    ignored_re!(ir17, ROOT, r"\*", "*");
+    ignored_re!(ir18, ROOT, "*.rs\n^a.o", "a.o"); // invalid regex skipped
+
+    not_ignored_re!(irnot1, ROOT, r"^src/.*\.rs", "main.rs");
+    not_ignored_re!(irnot2, ROOT, "*.rs\n^a.o", "main.rs"); // invalid regex
 }
