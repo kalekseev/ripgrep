@@ -475,23 +475,6 @@ impl RGArg {
         });
         self
     }
-
-    /// Indicate that any value given to this argument should be a valid
-    /// line number width. A valid line number width cannot start with `0`
-    /// to maintain compatibility with future improvements that add support
-    /// for padding character specifies.
-    fn line_number_width(mut self) -> RGArg {
-        self.claparg = self.claparg.validator(|val| {
-            if val.starts_with("0") {
-                Err(String::from(
-                    "Custom padding characters are currently not supported. \
-                     Please enter only a numeric value."))
-            } else {
-                val.parse::<usize>().map(|_| ()).map_err(|err| err.to_string())
-            }
-        });
-        self
-    }
 }
 
 // We add an extra space to long descriptions so that a black line is inserted
@@ -535,7 +518,6 @@ pub fn all_args_and_flags() -> Vec<RGArg> {
     flag_ignore_file(&mut args);
     flag_invert_match(&mut args);
     flag_line_number(&mut args);
-    flag_line_number_width(&mut args);
     flag_line_regexp(&mut args);
     flag_max_columns(&mut args);
     flag_max_count(&mut args);
@@ -544,6 +526,7 @@ pub fn all_args_and_flags() -> Vec<RGArg> {
     flag_mmap(&mut args);
     flag_no_config(&mut args);
     flag_no_ignore(&mut args);
+    flag_no_ignore_messages(&mut args);
     flag_no_ignore_parent(&mut args);
     flag_no_ignore_vcs(&mut args);
     flag_no_messages(&mut args);
@@ -740,9 +723,17 @@ fn flag_column(args: &mut Vec<RGArg>) {
 Show column numbers (1-based). This only shows the column numbers for the first
 match on each line. This does not try to account for Unicode. One byte is equal
 to one column. This implies --line-number.
+
+This flag can be disabled with --no-column.
 ");
     let arg = RGArg::switch("column")
-        .help(SHORT).long_help(LONG);
+        .help(SHORT).long_help(LONG)
+        .overrides("no-column");
+    args.push(arg);
+
+    let arg = RGArg::switch("no-column")
+        .hidden()
+        .overrides("column");
     args.push(arg);
 }
 
@@ -1091,18 +1082,6 @@ terminal.
     args.push(arg);
 }
 
-fn flag_line_number_width(args: &mut Vec<RGArg>) {
-    const SHORT: &str = "Left pad line numbers up to NUM width.";
-    const LONG: &str = long!("\
-Left pad line numbers up to NUM width. Space is used as the default padding
-character. This has no effect if --no-line-number is enabled.
-");
-    let arg = RGArg::flag("line-number-width", "NUM")
-        .help(SHORT).long_help(LONG)
-        .line_number_width();
-    args.push(arg);
-}
-
 fn flag_line_regexp(args: &mut Vec<RGArg>) {
     const SHORT: &str = "Only show matches surrounded by line boundaries.";
     const LONG: &str = long!("\
@@ -1240,6 +1219,25 @@ This flag can be disabled with the --ignore flag.
     args.push(arg);
 }
 
+fn flag_no_ignore_messages(args: &mut Vec<RGArg>) {
+    const SHORT: &str = "Suppress gitignore parse error messages.";
+    const LONG: &str = long!("\
+Suppresses all error messages related to parsing ignore files such as .ignore
+or .gitignore.
+
+This flag can be disabled with the --ignore-messages flag.
+");
+    let arg = RGArg::switch("no-ignore-messages")
+        .help(SHORT).long_help(LONG)
+        .overrides("ignore-messages");
+    args.push(arg);
+
+    let arg = RGArg::switch("ignore-messages")
+        .hidden()
+        .overrides("no-ignore-messages");
+    args.push(arg);
+}
+
 fn flag_no_ignore_parent(args: &mut Vec<RGArg>) {
     const SHORT: &str = "Don't respect ignore files in parent directories.";
     const LONG: &str = long!("\
@@ -1279,10 +1277,10 @@ This flag can be disabled with the --ignore-vcs flag.
 }
 
 fn flag_no_messages(args: &mut Vec<RGArg>) {
-    const SHORT: &str = "Suppress all error messages.";
+    const SHORT: &str = "Suppress some error messages.";
     const LONG: &str = long!("\
-Suppress all error messages. This provides the same behavior as redirecting
-stderr to /dev/null on Unix-like systems.
+Suppress all error messages related to opening and reading files. Error
+messages related to the syntax of the pattern given are still shown.
 
 This flag can be disabled with the --messages flag.
 ");

@@ -223,7 +223,9 @@ impl Ignore {
     fn add_child_path(&self, dir: &Path) -> (IgnoreInner, Option<Error>) {
         let mut errs = PartialErrorBuilder::default();
         let custom_ig_matcher =
-            {
+            if self.0.custom_ignore_filenames.is_empty() {
+                Gitignore::empty()
+            } else {
                 let (m, err) =
                     create_gitignore(&dir, &self.0.custom_ignore_filenames);
                 errs.maybe_push(err);
@@ -278,7 +280,7 @@ impl Ignore {
             git_exclude_matcher: gi_exclude_matcher,
             hg_global_matcher: self.0.hg_global_matcher.clone(),
             hg_ignore_matcher: hgi_matcher,
-            has_git: dir.join(".git").is_dir(),
+            has_git: dir.join(".git").exists(),
             opts: self.0.opts,
         };
         (ig, errs.into_error_option())

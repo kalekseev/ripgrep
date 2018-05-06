@@ -56,13 +56,13 @@ pub struct Args {
     invert_match: bool,
     line_number: bool,
     line_per_match: bool,
-    line_number_width: Option<usize>,
     max_columns: Option<usize>,
     max_count: Option<u64>,
     max_filesize: Option<u64>,
     maxdepth: Option<usize>,
     mmap: bool,
     no_ignore: bool,
+    no_ignore_messages: bool,
     no_ignore_parent: bool,
     no_ignore_vcs: bool,
     no_messages: bool,
@@ -190,8 +190,7 @@ impl Args {
             .only_matching(self.only_matching)
             .path_separator(self.path_separator)
             .with_filename(self.with_filename)
-            .max_columns(self.max_columns)
-            .line_number_width(self.line_number_width);
+            .max_columns(self.max_columns);
         if let Some(ref rep) = self.replace {
             p = p.replace(rep.clone());
         }
@@ -308,6 +307,12 @@ impl Args {
         self.no_messages
     }
 
+    /// Returns true if error messages associated with parsing .ignore or
+    /// .gitignore files should be suppressed.
+    pub fn no_ignore_messages(&self) -> bool {
+        self.no_ignore_messages
+    }
+
     /// Create a new recursive directory iterator over the paths in argv.
     pub fn walker(&self) -> ignore::Walk {
         self.walker_builder().build()
@@ -327,7 +332,7 @@ impl Args {
         }
         for path in &self.ignore_files {
             if let Some(err) = wd.add_ignore(path) {
-                if !self.no_messages {
+                if !self.no_messages && !self.no_ignore_messages {
                     eprintln!("{}", err);
                 }
             }
@@ -396,7 +401,6 @@ impl<'a> ArgMatches<'a> {
             ignore_files: self.ignore_files(),
             invert_match: self.is_present("invert-match"),
             line_number: line_number,
-            line_number_width: try!(self.usize_of("line-number-width")),
             line_per_match: self.is_present("vimgrep"),
             max_columns: self.usize_of_nonzero("max-columns")?,
             max_count: self.usize_of("max-count")?.map(|n| n as u64),
@@ -404,6 +408,7 @@ impl<'a> ArgMatches<'a> {
             maxdepth: self.usize_of("maxdepth")?,
             mmap: mmap,
             no_ignore: self.no_ignore(),
+            no_ignore_messages: self.is_present("no-ignore-messages"),
             no_ignore_parent: self.no_ignore_parent(),
             no_ignore_vcs: self.no_ignore_vcs(),
             no_messages: self.is_present("no-messages"),
@@ -683,6 +688,9 @@ impl<'a> ArgMatches<'a> {
 
     /// Returns true if and only if column numbers should be shown.
     fn column(&self) -> bool {
+        if self.is_present("no-column") {
+            return false;
+        }
         self.is_present("column") || self.is_present("vimgrep")
     }
 

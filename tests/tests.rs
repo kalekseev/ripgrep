@@ -107,22 +107,6 @@ sherlock!(line_numbers, |wd: WorkDir, mut cmd: Command| {
     assert_eq!(lines, expected);
 });
 
-sherlock!(line_number_width, |wd: WorkDir, mut cmd: Command| {
-    cmd.arg("-n");
-    cmd.arg("--line-number-width").arg("2");
-    let lines: String = wd.stdout(&mut cmd);
-    let expected = " 1:For the Doctor Watsons of this world, as opposed to the Sherlock
- 3:be, to a very large extent, the result of luck. Sherlock Holmes
-";
-    assert_eq!(lines, expected);
-});
-
-sherlock!(line_number_width_padding_character_error, |wd: WorkDir, mut cmd: Command| {
-    cmd.arg("-n");
-    cmd.arg("--line-number-width").arg("02");
-    wd.assert_non_empty_stderr(&mut cmd);
-});
-
 sherlock!(columns, |wd: WorkDir, mut cmd: Command| {
     cmd.arg("--column");
     let lines: String = wd.stdout(&mut cmd);
@@ -651,7 +635,7 @@ sherlock!(ignore_git_parent_stop, "Sherlock", ".",
     //
     // .gitignore (contains `sherlock`)
     // foo/
-    //   .git
+    //   .git/
     //   bar/
     //      sherlock
     //
@@ -662,6 +646,39 @@ sherlock!(ignore_git_parent_stop, "Sherlock", ".",
     wd.create(".gitignore", "sherlock\n");
     wd.create_dir("foo");
     wd.create_dir("foo/.git");
+    wd.create_dir("foo/bar");
+    wd.create("foo/bar/sherlock", hay::SHERLOCK);
+    cmd.current_dir(wd.path().join("foo").join("bar"));
+
+    let lines: String = wd.stdout(&mut cmd);
+    let expected = "\
+sherlock:For the Doctor Watsons of this world, as opposed to the Sherlock
+sherlock:be, to a very large extent, the result of luck. Sherlock Holmes
+";
+    assert_eq!(lines, expected);
+});
+
+// Like ignore_git_parent_stop, but with a .git file instead of a .git
+// directory.
+sherlock!(ignore_git_parent_stop_file, "Sherlock", ".",
+|wd: WorkDir, mut cmd: Command| {
+    // This tests that searching parent directories for .gitignore files stops
+    // after it sees a .git *file*. A .git file is used for submodules. To test
+    // this, we create this directory hierarchy:
+    //
+    // .gitignore (contains `sherlock`)
+    // foo/
+    //   .git
+    //   bar/
+    //      sherlock
+    //
+    // And we perform the search inside `foo/bar/`. ripgrep will stop looking
+    // for .gitignore files after it sees `foo/.git`, and therefore not
+    // respect the top-level `.gitignore` containing `sherlock`.
+    wd.remove("sherlock");
+    wd.create(".gitignore", "sherlock\n");
+    wd.create_dir("foo");
+    wd.create("foo/.git", "");
     wd.create_dir("foo/bar");
     wd.create("foo/bar/sherlock", hay::SHERLOCK);
     cmd.current_dir(wd.path().join("foo").join("bar"));
@@ -799,6 +816,34 @@ sherlock:1:16:For the Doctor Watsons of this world, as opposed to the Sherlock
 sherlock:1:57:For the Doctor Watsons of this world, as opposed to the Sherlock
 sherlock:3:49:be, to a very large extent, the result of luck. Sherlock Holmes
 sherlock:5:12:but Doctor Watson has to have it taken out for him and dusted,
+";
+    assert_eq!(lines, expected);
+});
+
+sherlock!(vimgrep_no_line, "Sherlock|Watson", ".",
+|wd: WorkDir, mut cmd: Command| {
+    cmd.arg("--vimgrep").arg("-N");
+
+    let lines: String = wd.stdout(&mut cmd);
+    let expected = "\
+sherlock:16:For the Doctor Watsons of this world, as opposed to the Sherlock
+sherlock:57:For the Doctor Watsons of this world, as opposed to the Sherlock
+sherlock:49:be, to a very large extent, the result of luck. Sherlock Holmes
+sherlock:12:but Doctor Watson has to have it taken out for him and dusted,
+";
+    assert_eq!(lines, expected);
+});
+
+sherlock!(vimgrep_no_line_no_column, "Sherlock|Watson", ".",
+|wd: WorkDir, mut cmd: Command| {
+    cmd.arg("--vimgrep").arg("-N").arg("--no-column");
+
+    let lines: String = wd.stdout(&mut cmd);
+    let expected = "\
+sherlock:For the Doctor Watsons of this world, as opposed to the Sherlock
+sherlock:For the Doctor Watsons of this world, as opposed to the Sherlock
+sherlock:be, to a very large extent, the result of luck. Sherlock Holmes
+sherlock:but Doctor Watson has to have it taken out for him and dusted,
 ";
     assert_eq!(lines, expected);
 });
@@ -1821,6 +1866,7 @@ fn feature_411_parallel_search_stats() {
     let mut cmd = wd.command();
     cmd.arg("--stats");
     cmd.arg("Sherlock");
+    cmd.arg("./");
 
     let lines: String = wd.stdout(&mut cmd);
     assert_eq!(lines.contains("4 matched lines"), true);
@@ -1976,7 +2022,7 @@ fn regression_270() {
     wd.create("foo", "-test");
 
     let mut cmd = wd.command();
-    cmd.arg("-e").arg("-test");
+    cmd.arg("-e").arg("-test").arg("./");
     let lines: String = wd.stdout(&mut cmd);
     assert_eq!(lines, path("foo:-test\n"));
 }
@@ -2125,7 +2171,7 @@ fn regression_693_context_option_in_contextless_mode() {
     wd.create("bar", "xyz\n");
 
     let mut cmd = wd.command();
-    cmd.arg("-C1").arg("-c").arg("--sort-files").arg("xyz");
+    cmd.arg("-C1").arg("-c").arg("--sort-files").arg("xyz").arg("./");
 
     let lines: String = wd.stdout(&mut cmd);
     let expected = "\
